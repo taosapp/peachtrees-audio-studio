@@ -1,0 +1,68 @@
+# ── Web 框架 ──
+fastapi>=0.104.0
+uvicorn>=0.24.0
+python-multipart>=0.0.6
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# ── TTS / ASR ──
+# torch/torchaudio 必须锁定版本，pip 默认源装的是 CPU 版且会被其他包拉高版本
+# GPU: 需先手动执行：
+#   pip install torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu126
+# 装完后下面两行约束防止 pip install -r 时被升级
+torch==2.6.0
+torchaudio==2.6.0
+transformers>=4.36.0
+ffmpeg-python>=0.2.0
+scipy
+pydub>=0.25.1
+cn2an
+
+# ── CosyVoice3 完整依赖 ──
+# 来源：third_party/cosyvoice/requirements.txt（已排除 Linux-only deps）
+hyperpyyaml
+onnxruntime
+conformer
+diffusers
+gdown
+grpcio
+grpcio-tools
+hydra-core
+inflect
+librosa
+lightning
+matplotlib
+modelscope
+networkx
+omegaconf
+onnx
+protobuf
+pyarrow
+pyworld
+rich
+soundfile
+sympy
+tensorboard
+wetext
+wget
+x-transformers
+
+# ── Matcha-TTS 依赖 ──
+# 来源：third_party/matcha-tts/requirements.txt（仅运行时必需）
+torchvision
+torchmetrics
+rootutils
+phonemizer
+Cython
+Unidecode
+einops
+pandas
+
+# 数据库（仅 SQLite）
+sqlalchemy>=2.0.0
+aiosqlite>=0.19.0
+
+# ── 工具 ──
+python-dotenv>=1.0.0
+aiofiles>=23.0.0
+numpy

@@ -1,0 +1,59 @@
+# ── 大模型权重文件（~7.2 GB，需手动下载，不应纳入版本控制）─────────────────
+# CosyVoice3 预训练权重 (.pt, .onnx, .safetensors)
+backend/models/CosyVoice/*.pt
+backend/models/CosyVoice/*.onnx
+backend/models/CosyVoice/*.safetensors
+backend/models/CosyVoice/CosyVoice-BlankEN/
+backend/models/CosyVoice/.msc
+backend/models/CosyVoice/.mv
+# Whisper 模型权重
+backend/models/whisper/
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# ── 运行时数据 ──────────────────────────────────────────────────────────────
+backend/voices/
+backend/tts_outputs/
+backend/data/
+*.db
+*.db-shm
+*.db-wal
+
+# ── 前端 ───────────────────────────────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/.vite/
+.pnpm-store/
+*.log
+
+# ── 环境与依赖 ─────────────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env
+.env.local
+*.env.local
+
+# ── IDE ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── 系统杂项 ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
