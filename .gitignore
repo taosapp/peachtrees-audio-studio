@@ -24,10 +24,9 @@ htmlcov/
 .coverage.*
 
 # ── 运行时数据 ──────────────────────────────────────────────────────────────
-backend/voices/
+# 注意：backend/voices/ 和 backend/data/*.db 作为预置音色提交
+#       但 SQLite WAL 运行时文件不提交
 backend/tts_outputs/
-backend/data/
-*.db
 *.db-shm
 *.db-wal
 
