@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PeachTrees 任务记录页修复说明</title>
+<style>
+  :root { --bg:#f5f7fa; --card:#fff; --text:#303133; --muted:#909399; --primary:#6366f1; --ok:#67c23a; --warn:#e6a23c; --danger:#f56c6c; --border:#e4e7ed; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:"Segoe UI","Microsoft YaHei",sans-serif; line-height:1.7; }
+  .wrap { max-width:960px; margin:0 auto; padding:32px 20px 64px; }
+  h1 { font-size:24px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:24px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:20px 24px; margin-bottom:20px; }
+  .card h2 { font-size:16px; margin:0 0 12px; display:flex; align-items:center; gap:8px; }
+  .dot { width:10px; height:10px; border-radius:50%; display:inline-block; flex:none; }
+  .dot-blue { background:var(--primary); } .dot-green { background:var(--ok); } .dot-orange { background:var(--warn); } .dot-red { background:var(--danger); }
+  table { width:100%; border-collapse:collapse; font-size:13.5px; }
+  th, td { text-align:left; padding:9px 10px; border-bottom:1px solid var(--border); vertical-align:top; }
+  th { background:#fafafa; font-weight:600; white-space:nowrap; }
+  code { background:#f0f0f5; border-radius:4px; padding:1px 6px; font-size:12.5px; font-family:Consolas,monospace; }
+  .tag { display:inline-block; background:#f0f0ff; color:var(--primary); border-radius:999px; padding:1px 10px; font-size:12px; }
+  .ok { color:var(--ok); font-weight:600; }
+  .warn { color:var(--warn); font-weight:600; }
+  .metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:14px; margin:14px 0; }
+  .metric { background:#fafaff; border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
+  .metric .num { font-size:20px; font-weight:700; color:var(--primary); }
+  .metric .lbl { font-size:12.5px; color:var(--muted); margin-top:2px; }
+  ul { margin:8px 0; padding-left:20px; }
+  li { margin-bottom:6px; }
+  .footer { color:var(--muted); font-size:12.5px; text-align:center; margin-top:28px; }
+  .before-after { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:640px){ .before-after { grid-template-columns:1fr; } }
+  .box { border-radius:10px; padding:14px 16px; font-size:13.5px; }
+  .box.bad { background:#fef0f0; border:1px solid #fde2e2; }
+  .box.good { background:#f0f9eb; border:1px solid #e1f3d8; }
+  .box .t { font-weight:700; margin-bottom:6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🍑 PeachTrees 任务记录页修复说明</h1>
+  <div class="sub">2026-08-12 · 修复合成期间任务列表卡 loading + 新增时长列</div>
+
+  <div class="card">
+    <h2><span class="dot dot-blue"></span>问题 1：合成期间任务记录页整页 loading 的根因</h2>
+    <p>提交合成任务后，后台任务 <code>_process_tts_sync</code> 由 FastAPI BackgroundTasks 以<strong>协程</strong>形式运行在事件循环中，但它直接同步调用了 <code>tts_service.generate_speech()</code>——该函数内部会<strong>阻塞轮询</strong>等待 worker 子进程返回结果（最长 300 秒）。</p>
+    <p>结果：合成期间整个事件循环被占死，<strong>所有 API 都无法响应</strong>（任务列表、状态查询、下载全部挂起）。前端请求一直 pending，<code>v-loading</code> 遮罩就转个不停，看起来"整个列表在 loading"。</p>
+    <div class="before-after">
+      <div class="box bad"><div class="t">✗ 修复前</div>事件循环被同步合成调用阻塞 → 列表接口 300s 内不返回 → 整页 spinner，历史任务也看不到。</div>
+      <div class="box good"><div class="t">✓ 修复后</div><code>generate_speech</code> 放入线程池（<code>asyncio.to_thread</code>）→ 事件循环保持响应 → 列表秒回，历史任务立即可见。</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2><span class="dot dot-blue"></span>修复方案</h2>
+    <div class="metrics">
+      <div class="metric"><div class="num">asyncio.to_thread</div><div class="lbl">同步合成调用移入线程池执行</div></div>
+      <div class="metric"><div class="num">单项 spinner</div><div class="lbl">仅进行中任务显示加载图标</div></div>
+      <div class="metric"><div class="num">5s 轮询</div><div class="lbl">有进行中任务时列表自动静默刷新</div></div>
+      <div class="metric"><div class="num">2 个时长字段</div><div class="lbl">音频时长 + 合成耗时</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2><span class="dot dot-green"></span>问题 2：任务列表新增时长列</h2>
+    <p>任务记录列表新增两列：</p>
+    <table>
+      <tr><th>列名</th><th>数据来源</th><th>说明</th></tr>
+      <tr><td>音频时长</td><td><code>tts_duration_sec</code>（已有字段）</td><td>合成出的音频长度，历史任务已有数据，格式如 <code>34.0 秒</code> / <code>1:23</code></td></tr>
+      <tr><td>合成耗时</td><td><code>elapsed_sec</code>（新增字段）</td><td>提交 → 完成的过程耗时，秒级精度；旧任务无数据显示 —</td></tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2><span class="dot dot-orange"></span>改动文件清单</h2>
+    <table>
+      <tr><th>文件</th><th>改动</th></tr>
+      <tr><td><code>backend/api/v1/tasks.py</code></td><td>① <code>generate_speech</code> 改用 <code>await asyncio.to_thread(...)</code>；② 合成开始/结束记录耗时写入 <code>elapsed_sec</code>（成功与失败都记录）；③ 列表接口新增 <code>status</code> 过滤参数；④ 列表/详情接口返回 <code>tts_duration_sec</code>、<code>elapsed_sec</code></td></tr>
+      <tr><td><code>backend/models/task.py</code></td><td>新增 <code>elapsed_sec</code> 字段（合成过程耗时，秒）</td></tr>
+      <tr><td><code>backend/core/database.py</code></td><td>新增 <code>ensure_schema()</code>：老库自动 <code>ALTER TABLE</code> 补列（幂等）</td></tr>
+      <tr><td><code>backend/main.py</code></td><td>启动 lifespan 调用 <code>ensure_schema()</code></td></tr>
+      <tr><td><code>frontend/src/views/Tasks.vue</code></td><td>① 状态列：排队中/处理中显示单项 spinner + 文字；② 新增"音频时长""合成耗时"两列；③ 存在进行中任务时每 5s 静默刷新，全部结束自动停止；④ 状态筛选下拉真正生效（此前参数被前端丢弃）；⑤ 轮询失败静默不弹错</td></tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2><span class="dot dot-green"></span>验证结果</h2>
+    <ul>
+      <li><span class="ok">✓</span> 数据库迁移：真实库执行 <code>ensure_schema()</code> 两次均幂等通过，<code>elapsed_sec</code> 列存在且可读写（历史任务该列为 NULL，属预期）</li>
+      <li><span class="ok">✓</span> 后端 API 冒烟：<code>GET /api/v1/tasks</code> 返回 200，携带 <code>tts_duration_sec</code> / <code>elapsed_sec</code> 字段；<code>status=done</code> 过滤生效（返回全部为 done）</li>
+      <li><span class="ok">✓</span> 前端 <code>vite build</code> 构建通过（Tasks 组件编译无错误）</li>
+      <li><span class="ok">✓</span> 全部 Python 文件 <code>py_compile</code> 语法检查通过</li>
+    </ul>
+    <p><span class="warn">⚠</span> 合成期间事件循环不再阻塞这一行为，需重启后端后在真实合成场景下确认（见下方重启步骤）。</p>
+  </div>
+
+  <div class="card">
+    <h2><span class="dot dot-orange"></span>重启步骤</h2>
+    <ul>
+      <li>后端：运行 <code>manage.bat</code> → 选 3（重启前后端服务），或手动重启 FastAPI（<code>python backend/main.py</code>）</li>
+      <li>前端：若用 Vite dev server（5173 端口），无需重启，热更新自动生效；若用构建产物，重新 <code>npm run build</code> 即可</li>
+      <li>数据库无需手动操作：首次启动会自动补列</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2><span class="dot dot-blue"></span>后续可扩展方向</h2>
+    <ul>
+      <li>真实任务队列（asyncio.Queue）替代单任务互斥，支持排队合成多个文本</li>
+      <li>合成耗时统计图表（控制台页展示平均耗时/成功率）</li>
+      <li>任务详情页（当前列表行内展示，可扩展点击查看完整文本）</li>
+    </ul>
+  </div>
+
+  <div class="footer">PeachTrees Media Studio · 代码助手修复记录 2026-08-12</div>
+</div>
+</body>
+</html>

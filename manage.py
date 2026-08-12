@@ -175,8 +175,9 @@ def start_services():
     
     try:
         if IS_WINDOWS:
-            # 在 Windows 上启动新独立 cmd 窗口，使用简单无嵌套外引号的写法，极其稳定
-            subprocess.Popen(f'start "PeachTrees 后端 API 服务" cmd /k cd /d "{backend_dir}" ^&^& {backend_cmd}', shell=True)
+            # 在 Windows 上启动新独立 cmd 窗口（/c：服务进程被 stop/restart 终止后窗口自动关闭，
+            # 避免残留空窗口堆积；写法简单无嵌套外引号，极其稳定）
+            subprocess.Popen(f'start "PeachTrees 后端 API 服务" cmd /c cd /d "{backend_dir}" ^&^& {backend_cmd}', shell=True)
         else:
             # Unix-like 运行后台进程
             subprocess.Popen(backend_cmd, cwd=backend_dir, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -191,8 +192,9 @@ def start_services():
     
     try:
         if IS_WINDOWS:
-            # 在 Windows 上启动新独立 cmd 窗口，使用简单无嵌套外引号的写法，极其稳定
-            subprocess.Popen(f'start "PeachTrees 前端 Dev 服务" cmd /k cd /d "{frontend_dir}" ^&^& {frontend_cmd}', shell=True)
+            # 在 Windows 上启动新独立 cmd 窗口（/c：服务进程被 stop/restart 终止后窗口自动关闭，
+            # 避免残留空窗口堆积；写法简单无嵌套外引号，极其稳定）
+            subprocess.Popen(f'start "PeachTrees 前端 Dev 服务" cmd /c cd /d "{frontend_dir}" ^&^& {frontend_cmd}', shell=True)
         else:
             # Unix-like 运行后台进程
             subprocess.Popen(frontend_cmd, cwd=frontend_dir, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

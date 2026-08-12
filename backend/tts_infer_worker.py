@@ -6,6 +6,7 @@ TTS 推理子进程 Worker (CosyVoice3)
 
 import json
 import os
+import re
 import sys
 import warnings
 import types
@@ -223,6 +224,39 @@ def check_models():
     print(f"[Worker] ✅ CosyVoice 模型目录已就绪 ({COSYVOICE_MODEL_DIR})", flush=True)
 
 
+# ── 拼音注音 / 发音纠正（词典外挂 CSV，见 pinyin_fixes.py）───────────────
+from pinyin_fixes import (
+    protect_pinyin_annotations,
+    convert_text_pinyin_annotations,
+    apply_pinyin_fixes,
+)
+
+
+# ── 标点停顿增强 ────────────────────────────────────────────────────────────
+# CosyVoice3 对顿号/引号/破折号的停顿学得不好（逗号停顿最稳定），
+# 合成前把弱停顿标点归一化为逗号/删除，保证朗读节奏。
+_PUNCT_PAUSE_MAP = [
+    ("——", "，"),
+    ("―", "，"),
+    ("—", "，"),
+    ("‥", "，"),
+    ("、", "，"),
+    ("“", ""),
+    ("”", ""),
+    ("‘", ""),
+    ("’", ""),
+]
+
+
+def _enhance_punctuation_pauses(text: str) -> str:
+    """把模型不停顿的标点归一化为有停顿的等价标点"""
+    if not text:
+        return text
+    for src, dst in _PUNCT_PAUSE_MAP:
+        text = text.replace(src, dst)
+    return text
+
+
 def _inference_zero_shot_no_leak(
     cosyvoice,
     tts_text: str,
@@ -232,6 +266,7 @@ def _inference_zero_shot_no_leak(
     stream: bool = False,
     speed: float = 1.0,
     text_frontend: bool = True,
+    pinyin_placeholders: dict = None,
 ):
     """
     自定义零样本推理：彻底避免 prompt_text 泄漏到合成语音中。
@@ -251,6 +286,8 @@ def _inference_zero_shot_no_leak(
     from functools import partial
 
     # 归一化 tts_text（不分割，得到完整的归一化文本）
+    # 注：用户注音 [zhu4] 已在 run_inference 层被保护为占位符（纯字母，
+    # wetext 不会改动），此处归一化后还原为拼音 token。
     normalized = cosyvoice.frontend.text_normalize(
         tts_text, split=False, text_frontend=text_frontend
     )
@@ -258,7 +295,22 @@ def _inference_zero_shot_no_leak(
     if not normalized:
         return
 
-    # 对于超长文本，使用更大的分片阈值（300 而非 80）以减少分片数量
+    # 还原并转换用户注音：[zhu4] → [zh][ù]（token 不在词表时保留原文）
+    valid_tokens = set(cosyvoice.frontend.tokenizer.tokenizer.additional_special_tokens)
+    if pinyin_placeholders:
+        for _ph, _orig in pinyin_placeholders.items():
+            normalized = normalized.replace(
+                _ph, convert_text_pinyin_annotations(_orig, valid_tokens)
+            )
+
+    # 拼音发音纠正（外挂 CSV 词典，见 pinyin_fixes.py）
+    normalized = apply_pinyin_fixes(normalized, valid_tokens)
+
+    # 标点停顿增强：顿号/破折号→逗号，中文引号删除（模型对引号不停顿）
+    normalized = _enhance_punctuation_pauses(normalized)
+
+    # 对于超长文本，分片合成（阈值 180 字/片：更小的片降低模型漏读/跳读概率，
+    # 实测 250-300 字/片时模型偶发漏读中间内容）
     if contains_chinese(normalized) and len(normalized) > 300:
         texts = list(split_paragraph(
             normalized,
@@ -267,9 +319,9 @@ def _inference_zero_shot_no_leak(
                 allowed_special=cosyvoice.frontend.allowed_special,
             ),
             "zh",
-            token_max_n=300,
-            token_min_n=200,
-            merge_len=50,
+            token_max_n=180,
+            token_min_n=120,
+            merge_len=30,
             comma_split=False,
         ))
         texts = [i for i in texts if not is_only_punctuation(i)]
@@ -364,7 +416,9 @@ def run_inference(
         print("[Worker] ✅ CosyVoice3 加载完成", flush=True)
 
         # 处理文本（validate_gen_text 内部完成数字转中文 + 清理 + 短文本校验）
-        gen_text_cleaned = validate_gen_text(gen_text)
+        # 注意：必须先保护用户注音 [zhu4]，否则数字调号会被数字转中文逻辑破坏
+        protected_gen_text, pinyin_placeholders = protect_pinyin_annotations(gen_text)
+        gen_text_cleaned = validate_gen_text(protected_gen_text)
         
         print(f"[Worker] gen_text={gen_text_cleaned!r}", flush=True)
 
@@ -455,6 +509,7 @@ def run_inference(
                 stream=False,
                 speed=speed,
                 text_frontend=True,
+                pinyin_placeholders=pinyin_placeholders,
             ):
                 audio_chunks.append(chunk['tts_speech'])
         else:
@@ -490,6 +545,7 @@ def run_inference(
                 stream=False,
                 speed=speed,
                 text_frontend=True,
+                pinyin_placeholders=pinyin_placeholders,
             ):
                 audio_chunks.append(chunk['tts_speech'])
 
@@ -616,6 +672,12 @@ def run_server_mode():
                     output_pt_path=req["output_pt_path"],
                 )
                 print(json.dumps(result), flush=True)
+                continue
+
+            # 预加载模型（后端启动时调用，避免首次合成等待模型加载）
+            if req.get("action") == "preload":
+                _load_cosyvoice_model()
+                print(json.dumps({"ok": True, "message": "model preloaded"}), flush=True)
                 continue
             
             # 普通语音合成请求

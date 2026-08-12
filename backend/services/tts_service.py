@@ -241,6 +241,8 @@ def validate_gen_text(gen_text: str) -> str:
 _cosyvoice_model = None
 _worker_lock = threading.Lock()
 _worker_proc = None
+# worker 是否已完成模型加载（预加载/合成成功后置 True；worker 重建后复位）
+_worker_model_loaded = False
 
 
 def _get_cosyvoice_model():
@@ -456,6 +458,9 @@ def _save_voice_feature_with_worker(
                 raise RuntimeError("TTS worker 管道不可用")
 
             start_time = time.time()
+            # 写入必须持锁（与预加载/其他请求串行，避免 stdin 交错）
+            proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            proc.stdin.flush()
         result_queue = queue.Queue(maxsize=1)
         stop_event = threading.Event()
 
@@ -484,9 +489,6 @@ def _save_voice_feature_with_worker(
         reader.start()
 
         try:
-            proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            proc.stdin.flush()
-
             while True:
                 elapsed = time.time() - start_time
                 if elapsed > timeout_sec:
@@ -499,6 +501,8 @@ def _save_voice_feature_with_worker(
                     result = result_queue.get(timeout=0.5)
                     if "error" in result:
                         raise RuntimeError(f"音色特征保存失败: {result['error']}")
+                    global _worker_model_loaded
+                    _worker_model_loaded = True
                     return result
                 except queue.Empty:
                     if proc.poll() is not None:
@@ -924,14 +928,86 @@ def _ensure_worker():
 
 def _kill_worker(proc):
     """强制终止卡死的 worker 进程并清空全局引用（下次请求自动重启）"""
-    global _worker_proc
+    global _worker_proc, _worker_model_loaded
     try:
         proc.kill()
     except Exception:
         pass
     if _worker_proc is proc:
         _worker_proc = None
+    _worker_model_loaded = False
     print("[TTS] ⚠️ worker 进程已强制终止，将在下次请求时自动重启", flush=True)
+
+
+def preload_worker(timeout_sec: int = 300):
+    """
+    预加载模型：启动 worker 并等待模型加载完成。
+    由后端启动时在后台线程调用，不阻塞 API；失败时首次合成会自动加载兜底。
+    整个流程持 _worker_lock，与合成/存音色请求串行，避免 stdin 交错。
+    """
+    import time
+    import threading
+    import queue
+
+    global _worker_model_loaded
+    payload = {"action": "preload"}
+    try:
+        with _worker_lock:
+            proc = _ensure_worker()
+            if not proc.stdin or not proc.stdout:
+                raise RuntimeError("TTS worker 管道不可用")
+
+            start_time = time.time()
+            result_queue = queue.Queue(maxsize=1)
+            stop_event = threading.Event()
+
+            def read_results():
+                try:
+                    while not stop_event.is_set():
+                        line = proc.stdout.readline()
+                        if not line:
+                            if proc.poll() is not None:
+                                break
+                            time.sleep(0.1)
+                            continue
+                        line = line.strip()
+                        if line.startswith("{"):
+                            try:
+                                result_queue.put(json.loads(line), timeout=1.0)
+                            except (json.JSONDecodeError, queue.Full):
+                                pass
+                except Exception as e:
+                    print(f"[TTS] 预加载 Reader error: {e}", flush=True)
+
+            reader = threading.Thread(target=read_results)
+            reader.daemon = True
+            reader.start()
+
+            try:
+                proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                proc.stdin.flush()
+                while True:
+                    elapsed = time.time() - start_time
+                    if elapsed > timeout_sec:
+                        print("[TTS] ⚠️ 模型预加载超时，将在首次合成时自动加载", flush=True)
+                        break
+                    try:
+                        result = result_queue.get(timeout=0.5)
+                        if "error" in result:
+                            print(f"[TTS] ⚠️ 模型预加载失败: {result['error']}", flush=True)
+                        else:
+                            _worker_model_loaded = True
+                            print("[TTS] ✅ 模型预加载完成，可直接开始合成", flush=True)
+                        break
+                    except queue.Empty:
+                        if proc.poll() is not None:
+                            print("[TTS] ⚠️ worker 进程在预加载期间退出，将在首次合成时重建", flush=True)
+                            break
+            finally:
+                stop_event.set()
+                reader.join(timeout=2.0)
+    except Exception as e:
+        print(f"[TTS] ⚠️ 模型预加载异常（首次合成时自动加载）: {e}", flush=True)
 
 
 def _run_tts_with_persistent_worker(
@@ -943,7 +1019,7 @@ def _run_tts_with_persistent_worker(
     cfg_strength: float,
     remove_silence: bool,
     out_wav: str,
-    timeout_sec: int = 300,
+    timeout_sec: int = 900,
     ref_pt_path: str = None,
 ) -> dict:
     import time
@@ -978,6 +1054,9 @@ def _run_tts_with_persistent_worker(
                 raise RuntimeError("TTS worker 管道不可用")
 
             start_time = time.time()
+            # 写入必须持锁（与预加载/其他请求串行，避免 stdin 交错）
+            proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            proc.stdin.flush()
         result_queue = queue.Queue(maxsize=1)
         stop_event = threading.Event()
 
@@ -1007,11 +1086,8 @@ def _run_tts_with_persistent_worker(
         reader.start()
 
         try:
-            # Send request
-            proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            proc.stdin.flush()
-
             # Wait for result with timeout
+            # （请求写入已在 _worker_lock 内完成，见上方锁块）
             while True:
                 elapsed = time.time() - start_time
                 if elapsed > timeout_sec:
@@ -1024,6 +1100,8 @@ def _run_tts_with_persistent_worker(
                     result = result_queue.get(timeout=0.5)
                     if "error" in result:
                         raise RuntimeError(f"TTS 合成失败: {result['error']}")
+                    global _worker_model_loaded
+                    _worker_model_loaded = True
                     return result
                 except queue.Empty:
                     if proc.poll() is not None:

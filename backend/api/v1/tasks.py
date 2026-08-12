@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import uuid
@@ -32,9 +33,12 @@ async def _process_tts_sync(
     # 强制禁用 libtorchcodec（子进程 worker 已独立处理，此处双重保险）
     import os as _os_proc3
     _os_proc3.environ["TORCHAUDIO_DISABLE_TORCHCODEC"] = "1"
+    import time as _time_proc
 
     from sqlalchemy import update as sa_update
     from services import tts_service
+
+    _started = _time_proc.monotonic()
 
     try:
         async def _update_status(status: str, message: str = "", **kwargs):
@@ -44,9 +48,27 @@ async def _process_tts_sync(
                 await db.execute(stmt)
                 await db.commit()
 
-        await _update_status("processing", "正在合成语音（加载模型中）...")
+        # 区分首次加载与正常合成：worker 懒加载，首次合成需启动进程并加载模型
+        _worker_loaded = False
+        try:
+            _proc = getattr(tts_service, "_worker_proc", None)
+            _worker_loaded = (
+                getattr(tts_service, "_worker_model_loaded", False)
+                and _proc is not None and _proc.poll() is None
+            )
+        except Exception:
+            pass
+        if _worker_loaded:
+            await _update_status("processing", "正在合成语音...")
+        else:
+            await _update_status("processing", "正在加载模型并合成（首次合成需 1-3 分钟）...")
 
-        result = tts_service.generate_speech(
+        # 关键修复：generate_speech 是同步阻塞调用（内部轮询等待 worker 子进程结果，
+        # 最长 300s）。若直接在事件循环中执行会阻塞整个 FastAPI 事件循环，
+        # 导致合成期间所有 API（任务列表/状态查询等）都无法响应，
+        # 前端表现为任务记录页一直 loading。必须放入线程池执行。
+        result = await asyncio.to_thread(
+            tts_service.generate_speech,
             ref_audio_path=ref_audio_path,
             ref_text=ref_text,
             gen_text=gen_text,
@@ -62,6 +84,7 @@ async def _process_tts_sync(
             result_path=result["output_path"],
             tts_duration_sec=result["duration_sec"],
             sample_rate=result["sample_rate"],
+            elapsed_sec=round(_time_proc.monotonic() - _started, 2),
         )
 
     except Exception as e:
@@ -69,7 +92,8 @@ async def _process_tts_sync(
         traceback.print_exc()
         async with AsyncSessionLocal() as db:
             stmt = update(TaskRecord).where(TaskRecord.id == task_db_id).values(
-                status="failed", message=str(e)[:400]
+                status="failed", message=str(e)[:400],
+                elapsed_sec=round(_time_proc.monotonic() - _started, 2),
             )
             await db.execute(stmt)
             await db.commit()
@@ -99,7 +123,7 @@ async def submit_tts(
     background_tasks: BackgroundTasks,
     voice_name: str = Form(...),
     gen_text: str = Form(...),
-    speed: float = Form(1.0),
+    speed: float = Form(1.2),
     nfe_steps: int = Form(32),
     cfg_strength: float = Form(2.5),
     remove_silence: bool = Form(True),
@@ -226,6 +250,7 @@ async def get_task(
     if task.task_type == "tts":
         result["voice_name"] = task.voice_name
         result["gen_text"] = task.gen_text
+        result["elapsed_sec"] = task.elapsed_sec
         if task.status == "done" and task.result_path:
             result["result_filename"] = os.path.basename(task.result_path)
             result["tts_duration_sec"] = task.tts_duration_sec
@@ -239,13 +264,16 @@ async def list_tasks(
     page: int = 1,
     page_size: int = 10,
     task_type: str = "",
+    status: str = "",
     keyword: str = "",
     db: AsyncSession = Depends(get_db),
 ):
-    """查询任务列表，支持按类型过滤"""
+    """查询任务列表，支持按类型/状态过滤"""
     query = select(TaskRecord)
     if task_type:
         query = query.where(TaskRecord.task_type == task_type)
+    if status:
+        query = query.where(TaskRecord.status == status)
     if keyword:
         query = query.where(TaskRecord.filename.contains(keyword))
     query = query.order_by(TaskRecord.created_at.desc())
@@ -278,6 +306,9 @@ async def list_tasks(
                 "voice_name": t.voice_name,
                 "gen_text": t.gen_text[:50] + "..." if t.gen_text and len(t.gen_text) > 50 else t.gen_text,
                 "created_at": str(t.created_at),
+                "tts_duration_sec": t.tts_duration_sec,
+                "elapsed_sec": t.elapsed_sec,
+                "result_filename": os.path.basename(t.result_path) if t.status == "done" and t.result_path else None,
             }
             for t in tasks
         ],

@@ -61,6 +61,18 @@ async def get_db() -> AsyncSession:
         yield session
 
 
+async def ensure_schema():
+    """轻量迁移：为已存在的 SQLite 库补充新增列（create_all 不会修改已有表）"""
+    from sqlalchemy import text
+
+    async with engine.begin() as conn:
+        # task_records.elapsed_sec：合成过程耗时（秒）
+        rows = await conn.execute(text("PRAGMA table_info(task_records)"))
+        cols = {r[1] for r in rows}
+        if "elapsed_sec" not in cols:
+            await conn.execute(text("ALTER TABLE task_records ADD COLUMN elapsed_sec FLOAT"))
+
+
 # 关键：在此处导入所有模型，确保 relationship 字符串引用能正确解析
 # （SQLAlchemy 需要在 mapper 配置前看到所有关联的类）
 from models.task       import TaskRecord  # noqa: F401, E402

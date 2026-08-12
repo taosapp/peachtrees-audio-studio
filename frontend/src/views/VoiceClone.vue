@@ -10,12 +10,6 @@
         >
             <template #title>
                 <span>语音合成 (TTS): {{ ttsModelStatus.name }}</span>
-                <el-progress
-                    v-if="!ttsModelStatus.loaded"
-                    :percentage="ttsModelStatus.progress"
-                    :stroke-width="8"
-                    style="width: 120px; display: inline-block; margin-left: 12px; vertical-align: middle"
-                />
                 <span style="margin-left: 8px">{{ ttsModelStatus.message }}</span>
             </template>
         </el-alert>
@@ -321,9 +315,12 @@
                                             type="textarea"
                                             :rows="6"
                                             placeholder="输入要合成的文本内容..."
-                                            maxlength="500"
+                                            maxlength="1500"
                                             show-word-limit
                                         />
+                                        <div class="pinyin-hint">
+                                            多音字可用 <code>[zhu4]</code> 直接替换该字来纠正读音（数字为声调），如：著名 → [zhu4]名；勿写成 著[zhu4]名（会重复发音）
+                                        </div>
                                     </el-form-item>
 
                                     <!-- 高级参数 -->
@@ -685,7 +682,7 @@ function _stopElapsedTimer() {
 const synthForm = ref({
     voice_name: "",
     gen_text: "",
-    speed: 1.0,  // 与后端默认值保持一致
+    speed: 1.2,  // 与后端默认值保持一致（用户要求默认 1.2 倍速）
     remove_silence: true,
 });
 
@@ -805,7 +802,7 @@ function resetSynth() {
     audioUrl.value = "";
     synthForm.value.voice_name = "";
     synthForm.value.gen_text = "";
-    synthForm.value.speed = 1.0;
+    synthForm.value.speed = 1.2;
     synthForm.value.remove_silence = true;
 }
 
@@ -899,6 +896,20 @@ onBeforeUnmount(() => {
 .voice-form,
 .synth-form {
     margin-top: 16px;
+}
+
+.pinyin-hint {
+    margin-top: 6px;
+    font-size: 12px;
+    color: #909399;
+    line-height: 1.6;
+}
+.pinyin-hint code {
+    background: #f0f0f5;
+    border-radius: 4px;
+    padding: 0 4px;
+    color: #6366f1;
+    font-size: 12px;
 }
 
 .action-bar {

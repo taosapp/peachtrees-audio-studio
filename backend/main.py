@@ -28,7 +28,7 @@ from contextlib import asynccontextmanager
 
 from api.v1 import tts, tasks, models
 from core.config import get_settings
-from core.database import Base, engine
+from core.database import Base, engine, ensure_schema
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from init_voices import init_system_voices
@@ -40,7 +40,17 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await ensure_schema()
     await init_system_voices()
+    # 后台预加载 TTS 模型（不阻塞 API 启动；失败时首次合成自动加载兜底）
+    try:
+        import threading
+        from services import tts_service
+
+        threading.Thread(target=tts_service.preload_worker, daemon=True).start()
+        print("[Startup] 已在后台启动模型预加载（约 1-3 分钟）")
+    except Exception as e:
+        print(f"[Startup] ⚠️ 模型预加载启动失败: {e}")
     yield
     await engine.dispose()
 

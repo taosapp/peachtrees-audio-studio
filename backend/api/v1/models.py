@@ -11,7 +11,6 @@ router = APIRouter(prefix="/v1/models", tags=["模型状态"])
 class ModelStatus(BaseModel):
     name: str
     loaded: bool
-    progress: float  # 0-100
     message: str
 
 
@@ -43,32 +42,45 @@ def _get_tts_status() -> ModelStatus:
             has_model = os.path.exists(os.path.join(cosyvoice_dir, "cosyvoice3.yaml"))
             
             if has_model:
+                # 真实检测 worker 是否已完成模型加载（预加载标志 + 进程存活）
+                worker_loaded = False
+                try:
+                    from services import tts_service
+                    _proc = getattr(tts_service, "_worker_proc", None)
+                    worker_loaded = (
+                        getattr(tts_service, "_worker_model_loaded", False)
+                        and _proc is not None and _proc.poll() is None
+                    )
+                except Exception:
+                    pass
+
                 if task_status.get("tts_running"):
                     return ModelStatus(
                         name="CosyVoice3",
                         loaded=True,
-                        progress=100,
                         message="正在合成语音中..."
                     )
-                else:
+                if worker_loaded:
                     return ModelStatus(
                         name="CosyVoice3",
                         loaded=True,
-                        progress=100,
-                        message="模型就绪，可以开始合成"
+                        message="模型已加载，可以开始合成"
                     )
+                return ModelStatus(
+                    name="CosyVoice3",
+                    loaded=False,
+                    message="模型文件就绪，首次合成时自动加载（约 1-3 分钟）"
+                )
         
         return ModelStatus(
             name="CosyVoice3",
             loaded=False,
-            progress=0,
             message="模型文件未找到，请下载模型"
         )
     except Exception as e:
         return ModelStatus(
             name="CosyVoice3",
             loaded=False,
-            progress=0,
             message=f"错误: {str(e)}"
         )
 

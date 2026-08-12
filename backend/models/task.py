@@ -29,6 +29,7 @@ class TaskRecord(Base):
     result_path = Column(String(500), nullable=True) # 合成音频文件路径
     tts_duration_sec = Column(Float, nullable=True)  # 合成音频时长
     sample_rate = Column(Integer, nullable=True)     # 采样率
+    elapsed_sec = Column(Float, nullable=True)       # 合成过程耗时（秒，提交→完成）
 
     created_at = Column(DateTime, server_default=func.now(), index=True)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

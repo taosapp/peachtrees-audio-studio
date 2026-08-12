@@ -45,14 +45,49 @@
           </template>
         </el-table-column>
         <el-table-column prop="gen_text" label="合成文本" min-width="220" show-overflow-tooltip />
-        <el-table-column label="状态" width="100" align="center">
+        <el-table-column label="状态" width="110" align="center">
           <template #default="{ row }">
-            <el-tag :type="statusTagType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
+            <!-- 单项任务 loading：仅进行中的任务显示 spinner，历史任务保持可见 -->
+            <span v-if="row.status === 'pending' || row.status === 'processing'" class="status-loading">
+              <el-icon class="is-loading"><Loading /></el-icon>
+              <span>{{ statusLabel(row.status) }}</span>
+            </span>
+            <el-tag v-else :type="statusTagType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="音频时长" width="100" align="center">
+          <template #default="{ row }">
+            <span v-if="row.status === 'done' && row.tts_duration_sec">{{ formatDuration(row.tts_duration_sec) }}</span>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="合成耗时" width="110" align="center">
+          <template #default="{ row }">
+            <span v-if="row.elapsed_sec != null">{{ row.elapsed_sec.toFixed(1) }} 秒</span>
+            <span v-else class="muted">—</span>
           </template>
         </el-table-column>
         <el-table-column prop="message" label="说明" min-width="160" show-overflow-tooltip>
           <template #default="{ row }">
             <span :class="{ 'error-text': row.status === 'failed' }">{{ row.message || '—' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="播放" width="80" align="center">
+          <template #default="{ row }">
+            <el-button
+              v-if="row.status === 'done' && row.result_filename"
+              circle
+              size="small"
+              :type="playingId === row.task_id ? 'danger' : 'success'"
+              :title="playingId === row.task_id ? '停止播放' : '播放音频'"
+              @click="togglePlay(row)"
+            >
+              <el-icon>
+                <VideoPause v-if="playingId === row.task_id" />
+                <VideoPlay v-else />
+              </el-icon>
+            </el-button>
+            <span v-else class="muted">—</span>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="160" align="center">
@@ -97,9 +132,9 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Download, Refresh, Delete } from '@element-plus/icons-vue'
+import { Download, Refresh, Delete, Loading, VideoPlay, VideoPause } from '@element-plus/icons-vue'
 import { ttsAPI } from '@/api/tts'
 
 const tasks = ref([])
@@ -109,6 +144,61 @@ const page = ref(1)
 const pageSize = 10
 const statusFilter = ref('')
 const downloadingId = ref('')
+
+// ── 音频播放 ────────────────────────────────────────────
+// 同一时间只允许播放一条：播放新任务时自动停止上一条
+const playingId = ref('')
+let player = null
+
+function stopPlay() {
+  if (player) {
+    player.pause()
+    player.src = ''
+    player = null
+  }
+  playingId.value = ''
+}
+
+function togglePlay(row) {
+  if (playingId.value === row.task_id) {
+    stopPlay()
+    return
+  }
+  stopPlay()
+  if (!row.result_filename) return
+  const audio = new Audio(`/api/v1/tts/download/${encodeURIComponent(row.result_filename)}`)
+  player = audio
+  playingId.value = row.task_id
+  audio.addEventListener('ended', stopPlay)
+  audio.addEventListener('error', () => {
+    ElMessage.error('播放失败，音频文件可能不存在')
+    stopPlay()
+  })
+  audio.play().catch(() => {
+    ElMessage.error('播放失败，音频文件可能不存在')
+    stopPlay()
+  })
+}
+
+// 进行中任务轻量轮询：仅当列表存在 pending/processing 任务时每 5s 静默刷新，
+// 全部结束后自动停止，避免对已完成任务反复请求
+let pollTimer = null
+
+function startPolling() {
+  stopPolling()
+  pollTimer = setInterval(() => {
+    if (tasks.value.some(t => t.status === 'pending' || t.status === 'processing')) {
+      loadTasks(page.value, true)
+    }
+  }, 5000)
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
 
 const statCards = computed(() => {
   const counts = { done: 0, pending: 0, processing: 0, failed: 0 }
@@ -127,19 +217,24 @@ function statusTagType(s) {
   return { pending: 'info', processing: 'warning', done: 'success', failed: 'danger' }[s] || ''
 }
 
-async function loadTasks(p = 1) {
+function formatDuration(sec) {
+  const total = Math.round(sec || 0)
+  const m = Math.floor(total / 60)
+  const s = total % 60
+  return m > 0 ? `${m}:${String(s).padStart(2, '0')}` : `${total} 秒`
+}
+
+async function loadTasks(p = 1, silent = false) {
   loading.value = true
   page.value = p
   try {
     const params = { page: p, page_size: pageSize, task_type: 'tts' }
     if (statusFilter.value) params.status = statusFilter.value
-    // 后端列表接口暂不支持 status 过滤时按 keyword 兼容；此处仅传 task_type
-    delete params.status
     const res = await ttsAPI.getHistory(params)
     tasks.value = res.data.items || []
     total.value = res.data.total || 0
   } catch {
-    ElMessage.error('任务列表加载失败')
+    if (!silent) ElMessage.error('任务列表加载失败')
   } finally {
     loading.value = false
   }
@@ -203,11 +298,18 @@ async function removeTask(row) {
   }
 }
 
-onMounted(() => loadTasks(1))
+onMounted(() => {
+  loadTasks(1)
+  startPolling()
+})
+
+onUnmounted(() => {
+  stopPolling()
+  stopPlay()
+})
 </script>
 
 <style scoped>
-.tasks-page { max-width: 1200px; }
 .stats-row { margin-bottom: 20px; }
 .stat-card { border-radius: 10px; }
 .stat-content { display: flex; align-items: center; gap: 14px; }
@@ -224,5 +326,13 @@ onMounted(() => loadTasks(1))
 .header-actions { display: flex; gap: 8px; }
 .muted { color: #c0c4cc; }
 .error-text { color: #f56c6c; }
+.status-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: #e6a23c;
+}
+.status-loading .el-icon { font-size: 14px; }
 .pagination-row { margin-top: 16px; display: flex; justify-content: flex-end; }
 </style>

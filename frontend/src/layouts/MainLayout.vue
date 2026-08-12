@@ -2,7 +2,7 @@
   <el-container class="layout-wrapper">
     <!-- 侧边栏 -->
     <el-aside :width="isCollapsed ? '64px' : '220px'" class="sidebar">
-      <div class="logo" @click="router.push('/dashboard')">
+      <div class="logo" @click="router.push('/clone')">
         <span class="logo-icon">🍑</span>
         <span v-if="!isCollapsed" class="logo-text">PeachTrees</span>
       </div>
@@ -17,10 +17,6 @@
         active-text-color="#cba6f7"
         class="side-menu"
       >
-        <el-menu-item index="/dashboard">
-          <el-icon><DataAnalysis /></el-icon>
-          <template #title>控制台</template>
-        </el-menu-item>
         <el-menu-item index="/clone">
           <el-icon><User /></el-icon>
           <template #title>声音克隆</template>
@@ -46,7 +42,7 @@
       <el-header class="topbar">
         <div class="topbar-left">
           <el-breadcrumb separator="/">
-            <el-breadcrumb-item :to="{ path: '/dashboard' }">首页</el-breadcrumb-item>
+            <el-breadcrumb-item :to="{ path: '/clone' }">首页</el-breadcrumb-item>
             <el-breadcrumb-item>{{ currentPageTitle }}</el-breadcrumb-item>
           </el-breadcrumb>
         </div>
@@ -75,7 +71,6 @@ const isCollapsed = ref(false)
 const activeMenu = computed(() => route.path)
 
 const pageTitles = {
-  '/dashboard': '控制台',
   '/clone': '声音克隆',
   '/tasks': '任务记录',
 }
