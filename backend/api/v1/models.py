@@ -89,20 +89,5 @@ def _get_tts_status() -> ModelStatus:
 async def get_task_status():
     """获取当前任务运行状态"""
     from services.task_lock import get_all_task_status
-    
-    status = get_all_task_status()
-    
-    # 转换任务类型名称
-    task_type_map = {
-        "tts": "语音合成"
-    }
-    
-    current = status.get("current_task")
-    if current:
-        current["task_type_name"] = task_type_map.get(current.get("task_type", ""), current.get("task_type", ""))
-    
-    return {
-        "asr_running": False,
-        "tts_running": status.get("tts_running", False),
-        "current_task": current,
-    }
+
+    return get_all_task_status()

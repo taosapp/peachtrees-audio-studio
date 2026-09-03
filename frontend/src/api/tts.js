@@ -13,16 +13,11 @@ export const ttsAPI = {
   deleteVoice: (voiceName) => request.delete(`/v1/tts/voices/${encodeURIComponent(voiceName)}`),
 
   /**
-   * 提交TTS异步合成任务（新接口，推荐使用）
-   * @param {FormData} formData - voice_name, gen_text, speed, nfe_steps, cfg_strength, remove_silence
-   * @returns { task_id, task_type, message, queue_position, total_pending }
+   * 提交TTS异步合成任务（唯一的声音克隆合成入口）
+   * @param {FormData} formData - voice_name, gen_text, speed, remove_silence, seed
+   * @returns { task_id, task_type, message }
    */
   submitTask: (formData) => request.post('/v1/tts/submit', formData),
-
-  /**
-   * 旧同步合成（兼容保留）
-   */
-  synthesizeByVoice: (formData) => request.post('/v1/tts/synthesize/by_voice', formData),
 
   // 获取音色参考音频（用于试听）
   getVoiceAudio: (voiceName) => request.get(`/v1/tts/voices/${encodeURIComponent(voiceName)}/audio`, {

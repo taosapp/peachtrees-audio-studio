@@ -1,14 +1,13 @@
 """
 TTS API（文本转语音 / 声音克隆）
-音色管理 + 语音合成
+音色管理 + 音频下载；语音合成走 /v1/tts/submit 异步任务（见 api/v1/tasks.py）
 """
 import os
 import uuid
 import tempfile
-import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -154,154 +153,6 @@ async def get_voice_audio(
 
 
 # ── 语音合成 ─────────────────────────────────────────────────────────────────
-
-@router.post("/synthesize")
-async def synthesize_speech(
-    ref_audio: UploadFile = File(...),
-    ref_text: str = Form(""),
-    gen_text: str = Form(...),
-    speed: float = Form(1.0),
-    nfe_steps: int = Form(32),
-    cfg_strength: float = Form(2.5),
-    remove_silence: bool = Form(True),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    上传参考音频 + 文本，直接合成克隆语音（同步返回音频文件）。
-
-    - **ref_audio**: 参考音频文件（3-30 秒）
-    - **ref_text**: 参考音频文字
-    - **gen_text**: 要合成的文本内容
-    - **speed**: 语速（0.5-2.0，默认 1.0）
-    - **nfe_steps**: 推理步数（8-64，越大音质越好，默认 32）
-    - **cfg_strength**: CFG 强度（1.0-5.0，默认 2.5）
-    - **remove_silence**: 是否去除首尾静音
-    """
-    from sqlalchemy import select
-
-    tmp_path = None
-    try:
-        # 保存上传文件（校验格式与大小）
-        ext = _check_audio_ext(ref_audio.filename or "")
-        tmp_path = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4().hex}{ext}")
-        await _save_upload_file_streaming(
-            ref_audio,
-            Path(tmp_path),
-            max_bytes=settings.max_upload_mb * 1024 * 1024,
-        )
-
-        # 同步阻塞推理（最长 300s），放入线程池执行，避免卡死事件循环
-        result = await run_in_threadpool(
-            tts_service.generate_speech,
-            ref_audio_path=tmp_path,
-            ref_text=ref_text,
-            gen_text=gen_text,
-            speed=speed,
-            nfe_steps=nfe_steps,
-            cfg_strength=cfg_strength,
-            remove_silence=remove_silence,
-        )
-
-        await db.commit()
-
-        return {
-            "output_path": result["output_path"],
-            "duration_sec": result["duration_sec"],
-            "sample_rate": result["sample_rate"],
-            "info": result["info"],
-        }
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except Exception as e:
-        raise HTTPException(500, f"合成失败: {e}")
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-
-@router.post("/synthesize/by_voice")
-async def synthesize_by_saved_voice(
-    voice_name: str = Form(...),
-    gen_text: str = Form(...),
-    speed: float = Form(1.0),
-    nfe_steps: int = Form(32),
-    cfg_strength: float = Form(2.5),
-    remove_silence: bool = Form(True),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    使用已保存的音色合成语音（无需上传参考音频）。
-
-    - **voice_name**: 音色名称（从 /tts/voices 获取）
-    - **gen_text**: 要合成的文本内容
-    - **speed / nfe_steps / cfg_strength / remove_silence**: 同上
-    """
-    import traceback
-    from sqlalchemy import select
-    import os
-    from models.voice import Voice
-
-    try:
-        voices = await tts_service.list_voices(db)
-        voice_info = next((v for v in voices if v["name"] == voice_name), None)
-        if not voice_info:
-            available = [v["name"] for v in voices]
-            raise HTTPException(
-                404,
-                f"音色「{voice_name}」不存在！\n可用音色列表: {available if available else '（无）'}"
-            )
-
-        ref_audio_path = voice_info["ref_audio"]
-        ref_text = voice_info.get("ref_text", "")  # 使用数据库中保存的参考文字，不清空
-        ref_pt_path = voice_info.get("ref_pt")  # 音色特征文件（.pt），优先使用
-
-        if not os.path.exists(ref_audio_path):
-            available_files = tts_service._list_voice_files()
-            raise HTTPException(
-                500,
-                f"音色「{voice_name}」的参考音频文件不存在！\n"
-                f"尝试的路径: {ref_audio_path}\n"
-                f"系统中的可用音频文件: {available_files}"
-            )
-
-        # 同步阻塞推理（最长 300s），放入线程池执行，避免卡死事件循环
-        result = await run_in_threadpool(
-            tts_service.generate_speech,
-            ref_audio_path=ref_audio_path,
-            ref_text=ref_text,
-            gen_text=gen_text,
-            speed=speed,
-            nfe_steps=nfe_steps,
-            cfg_strength=cfg_strength,
-            remove_silence=remove_silence,
-            ref_pt_path=ref_pt_path,
-        )
-
-        # 如果 worker 懒生成了 .pt 文件，更新数据库记录
-        if result.get("generated_pt_path"):
-            gen_pt = result["generated_pt_path"]
-            gen_pt_rel = f"voices/{os.path.basename(gen_pt)}"
-            print(f"[TTS API] 更新音色「{voice_name}」的 .pt 记录: {gen_pt_rel}", flush=True)
-            r = await db.execute(select(Voice).where(Voice.name == voice_name))
-            voice_rec = r.scalar_one_or_none()
-            if voice_rec and not voice_rec.ref_pt:
-                voice_rec.ref_pt = gen_pt_rel
-                await db.commit()
-                print(f"[TTS API] ✅ 数据库已更新", flush=True)
-
-        return {
-            "voice_name": voice_name,
-            "output_path": result["output_path"],
-            "duration_sec": result["duration_sec"],
-            "sample_rate": result["sample_rate"],
-            "info": result["info"],
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(500, f"合成失败: {type(e).__name__}: {e}")
-
 
 @router.get("/download/{filename}")
 async def download_audio(

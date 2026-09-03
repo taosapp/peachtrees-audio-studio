@@ -165,6 +165,22 @@ _REQUIRED_MODELS = {
 _cosyvoice_model = None
 
 
+def _set_deterministic_seed(seed: int):
+    """在每次合成开始前固定所有推理相关的随机状态。"""
+    import random
+    import numpy as np
+
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
 def _load_cosyvoice_model():
     """加载 CosyVoice3 模型"""
     global _cosyvoice_model
@@ -267,6 +283,7 @@ def _inference_zero_shot_no_leak(
     speed: float = 1.0,
     text_frontend: bool = True,
     pinyin_placeholders: dict = None,
+    progress_cb=None,
 ):
     """
     自定义零样本推理：彻底避免 prompt_text 泄漏到合成语音中。
@@ -335,7 +352,9 @@ def _inference_zero_shot_no_leak(
     _eop_id = 151646
     _eop_prefix_token = None
 
-    for i in texts:
+    # 分片进度上报：每合成完一片回调一次（仅多片长文本有意义）
+    _total_chunks = len(texts)
+    for _chunk_idx, i in enumerate(texts):
         # 先用 frontend_zero_shot 获取完整 model_input（包含 prompt 字段）
         # 当 zero_shot_spk_id 为空时，需要 prompt_text 和 prompt_wav
         # 用于提取 embedding / speech_feat 等音色特征
@@ -376,33 +395,41 @@ def _inference_zero_shot_no_leak(
         ):
             yield model_output
 
+        if progress_cb and _total_chunks > 1:
+            try:
+                progress_cb(_chunk_idx + 1, _total_chunks)
+            except Exception:
+                pass
+
 
 def run_inference(
     ref_audio_path: str,
     ref_text: str,
     gen_text: str,
     speed: float,
-    nfe_steps: int,
-    cfg_strength: float,
     remove_silence: bool,
     output_path: str,
     ref_pt_path: str = None,
+    seed: int = 20260812,
+    progress_cb=None,
 ):
     """
     语音合成推理
-    
+
     Args:
         ref_audio_path: 参考音频路径（可为空，如果使用 ref_pt_path）
         ref_text: 参考文字
         gen_text: 要合成的文本
         speed: 语速
-        nfe_steps: 推理步数（已废弃）
-        cfg_strength: CFG 强度（已废弃）
         remove_silence: 是否去除静音
         output_path: 输出路径
         ref_pt_path: 音色特征文件路径（.pt），如果提供则优先使用
+        progress_cb: 分片合成进度回调 cb(done, total)，可为空
     """
     try:
+        # 每次请求重新设置随机状态，保证相同输入和参数尽量得到一致结果。
+        _set_deterministic_seed(seed)
+
         # 延迟导入
         from services.tts_service import (
             _clean_text_for_tts,
@@ -510,6 +537,7 @@ def run_inference(
                 speed=speed,
                 text_frontend=True,
                 pinyin_placeholders=pinyin_placeholders,
+                progress_cb=progress_cb,
             ):
                 audio_chunks.append(chunk['tts_speech'])
         else:
@@ -546,6 +574,7 @@ def run_inference(
                 speed=speed,
                 text_frontend=True,
                 pinyin_placeholders=pinyin_placeholders,
+                progress_cb=progress_cb,
             ):
                 audio_chunks.append(chunk['tts_speech'])
 
@@ -586,7 +615,7 @@ def run_inference(
 
         # 保存输出
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        sf.write(output_path, audio_out, sample_rate)
+        sf.write(output_path, audio_out, sample_rate, subtype="PCM_16")
 
         duration_sec = len(audio_out) / sample_rate
         print(
@@ -681,16 +710,24 @@ def run_server_mode():
                 continue
             
             # 普通语音合成请求
+            def _report_progress(done, total):
+                # 进度行（含 "progress" 键）与最终结果 JSON 同走 stdout，
+                # 主进程 reader 按 "progress" 键分流，不会误当合成结果
+                print(
+                    json.dumps({"progress": {"done": int(done), "total": int(total)}}),
+                    flush=True,
+                )
+
             result = run_inference(
                 ref_audio_path=req.get("ref_audio_path", ""),
                 ref_text=req.get("ref_text", ""),
                 gen_text=req["gen_text"],
                 speed=float(req.get("speed", 1.0)),
-                nfe_steps=int(req.get("nfe_steps", 32)),
-                cfg_strength=float(req.get("cfg_strength", 2.5)),
                 remove_silence=bool(req.get("remove_silence", True)),
                 output_path=req["output_path"],
                 ref_pt_path=req.get("ref_pt_path"),
+                seed=int(req.get("seed", 20260812)),
+                progress_cb=_report_progress,
             )
             print(json.dumps(result), flush=True)
         except Exception as e:
@@ -702,11 +739,11 @@ def main():
         run_server_mode()
         return
 
-    if len(sys.argv) < 9:
+    if len(sys.argv) < 7:
         print(
             json.dumps(
                 {
-                    "error": "参数不足: ref_audio ref_text gen_text speed nfe_steps cfg_strength remove_silence output_path"
+                    "error": "参数不足: ref_audio ref_text gen_text speed remove_silence output_path"
                 }
             )
         )
@@ -718,18 +755,14 @@ def main():
     ref_text = sys.argv[2]
     gen_text = sys.argv[3]
     speed = float(sys.argv[4])
-    nfe_steps = int(sys.argv[5])
-    cfg_strength = float(sys.argv[6])
-    remove_silence = sys.argv[7].lower() == "true"
-    output_path = sys.argv[8]
+    remove_silence = sys.argv[5].lower() == "true"
+    output_path = sys.argv[6]
     try:
         result = run_inference(
             ref_audio_path=ref_audio_path,
             ref_text=ref_text,
             gen_text=gen_text,
             speed=speed,
-            nfe_steps=nfe_steps,
-            cfg_strength=cfg_strength,
             remove_silence=remove_silence,
             output_path=output_path,
         )

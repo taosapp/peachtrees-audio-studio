@@ -8,11 +8,10 @@ import datetime as dt
 import asyncio
 import json
 import os
+import queue
 import re
-import shutil
 import subprocess
 import sys
-import tempfile
 import uuid
 import atexit
 import threading
@@ -243,27 +242,13 @@ _worker_lock = threading.Lock()
 _worker_proc = None
 # worker 是否已完成模型加载（预加载/合成成功后置 True；worker 重建后复位）
 _worker_model_loaded = False
-
-
-def _get_cosyvoice_model():
-    """获取 CosyVoice 模型（实际加载在 worker 进程中）"""
-    # 模型加载已移至 tts_infer_worker.py
-    # 此函数保留用于兼容性，实际不使用
-    return None
+# 常驻 stdout reader 的路由槽位：请求经 task_lock 串行，同一时刻只有一个
+# 请求在等待结果；请求开始时挂上队列与进度回调，结束时摘除（置 None）
+_response_queue = None
+_progress_cb = None
 
 
 # ── 音色管理（基于数据库）────────────────────────────────────────────────
-
-
-def _list_voice_files() -> list[str]:
-    """列出 voices 目录下所有可用的音频文件"""
-    voice_files = []
-    for directory in [VOICES_DIR, os.path.join(os.path.dirname(_BACKEND_DIR), "voices")]:
-        if os.path.isdir(directory):
-            for f in os.listdir(directory):
-                if f.endswith(".wav") or f.endswith(".mp3") or f.endswith(".flac"):
-                    voice_files.append(f)
-    return sorted(set(voice_files))
 
 
 def _voice_audio_path(v: "Voice") -> str:
@@ -284,29 +269,6 @@ def _voice_audio_path(v: "Voice") -> str:
         return legacy_path
 
     return canonical
-
-
-def validate_voice_audio_path(v: "Voice") -> str:
-    """验证音色音频文件是否存在，不存在则抛出详细错误"""
-    ref_audio = v.ref_audio
-    filename = os.path.basename(ref_audio) if ref_audio else f"{v.name}.wav"
-
-    canonical = os.path.join(VOICES_DIR, filename)
-    if os.path.exists(canonical):
-        return canonical
-
-    legacy_dir = os.path.join(os.path.dirname(_BACKEND_DIR), "voices")
-    legacy_path = os.path.join(legacy_dir, filename)
-    if os.path.exists(legacy_path):
-        return legacy_path
-
-    available = _list_voice_files()
-    raise FileNotFoundError(
-        f"音色「{v.name}」的参考音频文件不存在！\n"
-        f"尝试的路径: {canonical}\n"
-        f"数据库中的路径: {ref_audio}\n"
-        f"系统中的可用音色: {available if available else '（无）'}"
-    )
 
 
 def _get_audio_duration(file_path: str) -> float:
@@ -332,41 +294,48 @@ def _get_audio_duration(file_path: str) -> float:
     return 0.0
 
 
-async def list_voices(db=None) -> list[dict]:
-    """列出所有已保存的音色（异步版本，接受 DB session）"""
+# 音频时长缓存 {绝对路径: (mtime, 时长)}：音色列表在页面加载、提交任务等
+# 高频路径被查询，逐音色起 ffprobe 子进程开销大，按 mtime 失效直接复用结果
+_audio_duration_cache: dict[str, tuple[float, float]] = {}
+
+
+def _get_audio_duration_cached(file_path: str) -> float:
+    """带缓存的音频时长查询（文件 mtime 变化时重新探测）"""
+    try:
+        mtime = os.path.getmtime(file_path)
+    except OSError:
+        return 0.0
+    cached = _audio_duration_cache.get(file_path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    duration = _get_audio_duration(file_path)
+    _audio_duration_cache[file_path] = (mtime, duration)
+    return duration
+
+
+async def list_voices(db) -> list[dict]:
+    """查询所有已保存的音色（含文件定位、特征文件与时长信息）"""
     from models.voice import Voice
     from sqlalchemy import select
 
-    if db is None:
-        from core.database import AsyncSessionLocal
-
-        async with AsyncSessionLocal() as session:
-            return await _list_from_db(session)
-    return await _list_from_db(db)
-
-
-async def _list_from_db(session) -> list[dict]:
-    """从数据库查询音色列表"""
-    from models.voice import Voice
-    from sqlalchemy import select
-
-    result = await session.execute(select(Voice).order_by(Voice.created_at.desc()))
+    result = await db.execute(select(Voice).order_by(Voice.created_at.desc()))
     voices = result.scalars().all()
     ret = []
     for v in voices:
         ref_path = _voice_audio_path(v)
-        
-        # 构建 ref_pt 绝对路径
-        ref_pt_path = None
+
+        # 构建 ref_pt 绝对路径：优先按 UUID 定位，兼容数据库历史路径。
+        ref_pt_candidates = [os.path.join(VOICES_DIR, f"{v.uuid}.pt")]
         if v.ref_pt:
-            if os.path.isabs(v.ref_pt):
-                ref_pt_path = v.ref_pt
-            else:
-                ref_pt_path = os.path.join(VOICES_DIR, os.path.basename(v.ref_pt))
-        
-        # ffprobe 是同步子进程调用，放入线程池避免阻塞事件循环
-        duration = await asyncio.to_thread(_get_audio_duration, ref_path)
-        
+            ref_pt_candidates.append(
+                v.ref_pt if os.path.isabs(v.ref_pt)
+                else os.path.join(VOICES_DIR, os.path.basename(v.ref_pt))
+            )
+        ref_pt_path = next((p for p in ref_pt_candidates if os.path.isfile(p)), None)
+
+        # ffprobe 是同步子进程调用，放入线程池避免阻塞事件循环（结果带缓存）
+        duration = await asyncio.to_thread(_get_audio_duration_cached, ref_path)
+
         ret.append(
             {
                 "id": v.id,
@@ -375,8 +344,8 @@ async def _list_from_db(session) -> list[dict]:
                 "ref_audio": ref_path,
                 "ref_text": v.ref_text,
                 "ref_pt": ref_pt_path,
+                "ref_pt_exists": bool(ref_pt_path),
                 "ref_duration": duration,
-                "is_system": v.is_system,
             }
         )
     return ret
@@ -417,40 +386,79 @@ def _convert_to_wav(input_path: str, sample_rate: int = 24000) -> str:
     return tmp_wav
 
 
-def _save_voice_feature_with_worker(
-    ref_audio_path: str,
-    ref_text: str,
-    output_pt_path: str,
-    timeout_sec: int = 120,
-) -> dict:
+def _reader_loop(proc) -> None:
+    """worker stdout 常驻读取线程：每个 worker 进程生命周期内只有一个。
+
+    旧实现"每请求起 reader 线程 + join(2s) 后放弃"存在竞态：上一个请求的
+    残留线程可能仍阻塞在 readline() 上并抢走下一请求的响应行，导致该请求
+    一直等到超时。常驻线程 + 请求级路由槽位从根源上消除该问题。
     """
-    通过 worker 进程保存音色特征到 .pt 文件
-    
+    global _response_queue
+    while True:
+        try:
+            line = proc.stdout.readline()
+        except Exception:
+            line = ""
+        if not line:
+            break  # 进程退出 / 管道关闭
+        line = line.strip()
+        if not line.startswith("{"):
+            continue  # 模型日志等非 JSON 输出
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "progress" in obj:
+            cb = _progress_cb
+            if cb is not None:
+                try:
+                    cb(obj["progress"])
+                except Exception:
+                    pass
+            continue
+        q = _response_queue
+        if q is not None:
+            try:
+                q.put(obj, timeout=1.0)
+            except queue.Full:
+                pass
+
+
+def _start_reader_thread(proc) -> None:
+    threading.Thread(target=_reader_loop, args=(proc,), daemon=True).start()
+
+
+def _worker_request(
+    payload: dict,
+    timeout_sec: int,
+    label: str,
+    raise_on_failure: bool = True,
+    kill_on_timeout: bool = True,
+    progress_cb=None,
+) -> Optional[dict]:
+    """
+    向常驻 worker 发送一条 JSON 请求并等待结果（串行）。
+    预加载 / 音色特征保存 / 语音合成三类请求共用此通道：
+    获取 TTS 锁 → 挂载结果队列 → 写 payload → 轮询常驻 reader 路由的响应。
+
     Args:
-        ref_audio_path: 参考音频路径
-        ref_text: 参考文字
-        output_pt_path: 输出的 .pt 文件路径
-        timeout_sec: 超时时间
-    
+        label: 任务名（用于日志与错误信息）
+        raise_on_failure: False 时（预加载场景）失败只记日志并返回 None
+        kill_on_timeout: True 时超时杀掉 worker 进程让下次请求重建
+        progress_cb: 收到 {"progress": {...}} 进度行时回调（仅合成使用）
+
     Returns:
-        {"output_pt_path": "...", "spk_id": "..."}
+        worker 返回的 JSON dict；raise_on_failure=False 且失败时返回 None
     """
     import time
-    import threading
-    import queue
 
-    payload = {
-        "action": "save_voice_feature",
-        "ref_audio_path": ref_audio_path,
-        "ref_text": ref_text,
-        "output_pt_path": output_pt_path,
-    }
+    global _worker_model_loaded, _response_queue, _progress_cb
 
     from services.task_lock import acquire_tts_lock, release_tts_lock
-    
-    if not acquire_tts_lock(description="音色特征保存"):
+
+    if not acquire_tts_lock(description=label):
         raise RuntimeError("有其他语音合成任务正在进行中，请稍后重试")
-    
+
     try:
         with _worker_lock:
             proc = _ensure_worker()
@@ -458,60 +466,64 @@ def _save_voice_feature_with_worker(
                 raise RuntimeError("TTS worker 管道不可用")
 
             start_time = time.time()
-            # 写入必须持锁（与预加载/其他请求串行，避免 stdin 交错）
+            result_queue = queue.Queue(maxsize=1)
+            # 挂上本请求的路由槽位后再写入（请求串行，槽位同一时刻只有一份）
+            _response_queue = result_queue
+            _progress_cb = progress_cb
             proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
             proc.stdin.flush()
-        result_queue = queue.Queue(maxsize=1)
-        stop_event = threading.Event()
-
-        def read_results():
-            try:
-                while not stop_event.is_set():
-                    proc.stdout.flush()
-                    line = proc.stdout.readline()
-                    if not line:
-                        if proc.poll() is not None:
-                            break
-                        time.sleep(0.1)
-                        continue
-                    line = line.strip()
-                    if line.startswith("{"):
-                        try:
-                            # 在 reader 线程内完成 JSON 解析，解析失败不会影响主线程
-                            result_queue.put(json.loads(line), timeout=1.0)
-                        except (json.JSONDecodeError, queue.Full):
-                            pass
-            except Exception as e:
-                print(f"[音色特征保存] Reader error: {e}", flush=True)
-
-        reader = threading.Thread(target=read_results)
-        reader.daemon = True
-        reader.start()
 
         try:
             while True:
-                elapsed = time.time() - start_time
-                if elapsed > timeout_sec:
-                    # 超时大概率是 worker 内部卡死（模型死锁/音频异常），
-                    # 直接杀掉进程让下次请求重建，避免卡死请求持续堆积
-                    _kill_worker(proc)
-                    raise RuntimeError(f"音色特征保存超时（{timeout_sec}s），worker 已重启")
-
+                if time.time() - start_time > timeout_sec:
+                    if kill_on_timeout:
+                        # 超时大概率是 worker 内部卡死（模型死锁/音频异常），
+                        # 直接杀掉进程让下次请求重建，避免卡死请求持续堆积
+                        _kill_worker(proc)
+                        raise RuntimeError(f"{label}超时（{timeout_sec}s），worker 已重启")
+                    print(f"[TTS] ⚠️ {label}超时，将在首次合成时自动加载", flush=True)
+                    return None
                 try:
                     result = result_queue.get(timeout=0.5)
-                    if "error" in result:
-                        raise RuntimeError(f"音色特征保存失败: {result['error']}")
-                    global _worker_model_loaded
-                    _worker_model_loaded = True
-                    return result
                 except queue.Empty:
                     if proc.poll() is not None:
-                        raise RuntimeError("TTS worker 进程已退出")
+                        if raise_on_failure:
+                            raise RuntimeError(f"{label}失败：TTS worker 进程已退出")
+                        print(f"[TTS] ⚠️ worker 进程在{label}期间退出，将在首次合成时重建", flush=True)
+                        return None
+                    continue
+                if "error" in result:
+                    if raise_on_failure:
+                        raise RuntimeError(f"{label}失败: {result['error']}")
+                    print(f"[TTS] ⚠️ {label}失败: {result['error']}", flush=True)
+                    return None
+                _worker_model_loaded = True
+                return result
         finally:
-            stop_event.set()
-            reader.join(timeout=2.0)
+            # 摘除路由槽位：此后迟到的响应行由常驻 reader 直接丢弃
+            _response_queue = None
+            _progress_cb = None
     finally:
         release_tts_lock()
+
+
+def _save_voice_feature_with_worker(
+    ref_audio_path: str,
+    ref_text: str,
+    output_pt_path: str,
+    timeout_sec: int = 120,
+) -> dict:
+    """通过 worker 进程保存音色特征到 .pt 文件"""
+    return _worker_request(
+        {
+            "action": "save_voice_feature",
+            "ref_audio_path": ref_audio_path,
+            "ref_text": ref_text,
+            "output_pt_path": output_pt_path,
+        },
+        timeout_sec=timeout_sec,
+        label="音色特征保存",
+    )
 
 
 import uuid as uuid_module
@@ -548,6 +560,10 @@ def save_voice(
     """
     if not voice_name or not voice_name.strip():
         raise ValueError("音色名称不能为空")
+    if not ref_text or not ref_text.strip():
+        raise ValueError("语音识别模型已移除，请务必手动提供参考文字（必须与参考音频中的说话内容完全一致）")
+    ref_text_converted = _convert_digits_to_chinese(ref_text)
+    ref_text_cleaned = _clean_text_for_tts(ref_text_converted)
 
     # 生成或使用提供的 UUID
     if voice_uuid:
@@ -564,13 +580,25 @@ def save_voice(
 
     converted_path = None
     try:
-        # 先尝试直接读取（wav 格式）
+        # 先探测采样率：仅在无法直接读取或采样率非 24 kHz 时才转换一次，
+        # 避免 44.1k/48k 等 wav 输入触发两次 ffmpeg 转码 + 两次全量读取
+        target_sr = 24000
+        need_convert = True
         try:
-            orig_audio, orig_sr = sf.read(ref_audio_path)
+            info = sf.info(ref_audio_path)
+            need_convert = info.samplerate != target_sr
         except Exception:
-            # 非 wav 格式，用 ffmpeg 转换
-            converted_path = _convert_to_wav(ref_audio_path)
+            need_convert = True
+
+        if need_convert:
+            converted_path = _convert_to_wav(ref_audio_path, sample_rate=target_sr)
             orig_audio, orig_sr = sf.read(converted_path)
+        else:
+            orig_audio, orig_sr = sf.read(ref_audio_path)
+
+        # 统一为单声道，避免不同声道数造成特征差异
+        if getattr(orig_audio, "ndim", 1) > 1:
+            orig_audio = orig_audio.mean(axis=1)
 
         # 截断音频到最大 15 秒以防超过 CosyVoice 30秒限制
         max_duration = MAX_REF_SECONDS
@@ -580,17 +608,10 @@ def save_voice(
             print(f"[音色] 参考音频过长，已自动截断至前 {max_duration} 秒")
 
         # 保存为系统音色文件
-        sf.write(voice_wav_path, orig_audio, orig_sr)
+        sf.write(voice_wav_path, orig_audio, target_sr, subtype="PCM_16")
     finally:
         if converted_path and os.path.exists(converted_path):
             os.remove(converted_path)
-
-    # 参考文字处理
-    if not ref_text or not ref_text.strip():
-        raise ValueError("语音识别模型已移除，请务必手动提供参考文字（必须与参考音频中的说话内容完全一致）")
-    else:
-        ref_text_converted = _convert_digits_to_chinese(ref_text)
-        ref_text_cleaned = _clean_text_for_tts(ref_text_converted)
 
     # 保存音色特征 .pt 文件
     # 注意：CosyVoice3 的 LLM 要求 prompt_text 含 <|endofprompt|>（token 151646），
@@ -600,10 +621,18 @@ def save_voice(
     print(f"[音色] 正在保存音色特征: {voice_pt_path}")
     try:
         _save_voice_feature_with_worker(voice_wav_path, ref_text_llm, voice_pt_path)
+        if not os.path.isfile(voice_pt_path) or os.path.getsize(voice_pt_path) == 0:
+            raise RuntimeError("音色特征文件未生成或为空")
         print(f"[音色] ✅ 音色特征保存成功")
     except Exception as e:
-        print(f"[音色] ⚠️ 音色特征保存失败: {e}", file=sys.stderr)
-        voice_pt_path = None
+        # .pt 是已保存音色的必要条件，避免把半成品写入数据库。
+        for path in (voice_wav_path, voice_pt_path):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+        raise RuntimeError(f"音色特征提取失败，音色未保存: {e}") from e
 
     return {
         "name": vname,
@@ -648,7 +677,6 @@ async def save_voice_to_db(voice_data: dict, db) -> None:
             ref_audio=f"voices/{file_uuid}.wav",
             ref_text=voice_data["ref_text"],
             ref_pt=pt_path,
-            is_system=False,
         )
         db.add(voice)
     await db.commit()
@@ -661,9 +689,9 @@ class VoiceNotFoundError(Exception):
 
 
 
-async def delete_voice(voice_name: str, db=None):
+async def delete_voice(voice_name: str, db):
     """
-    删除音色（异步版本，接受 DB session）。
+    从数据库删除音色，并同步清理对应的 .wav / .pt 文件。
 
     Raises:
         VoiceNotFoundError: 音色不存在
@@ -671,31 +699,14 @@ async def delete_voice(voice_name: str, db=None):
     from models.voice import Voice
     from sqlalchemy import select
 
-    if db is None:
-        from core.database import AsyncSessionLocal
-
-        async with AsyncSessionLocal() as session:
-            return await _delete_from_db(voice_name, session)
-    return await _delete_from_db(voice_name, db)
-
-
-async def _delete_from_db(voice_name: str, session) -> None:
-    """从数据库删除音色，并同步清理对应的 .wav / .pt 文件"""
-    from models.voice import Voice
-    from sqlalchemy import select
-
-    r = await session.execute(select(Voice).where(Voice.name == voice_name))
+    r = await db.execute(select(Voice).where(Voice.name == voice_name))
     voice = r.scalar_one_or_none()
     if not voice:
         raise VoiceNotFoundError(f"音色「{voice_name}」不存在")
 
-    # 系统音色保护（当前版本未预置系统音色，保留保护逻辑）
-    if voice.is_system:
-        raise ValueError(f"音色「{voice_name}」为系统音色，不可删除")
-
     file_uuid = voice.uuid
-    await session.delete(voice)
-    await session.commit()
+    await db.delete(voice)
+    await db.commit()
     if file_uuid:
         _delete_voice_files(file_uuid)
 
@@ -703,141 +714,85 @@ async def _delete_from_db(voice_name: str, session) -> None:
 # ── TTS 克隆推理 ─────────────────────────────────────────────────────────────
 
 
-def _check_duration(audio_path: str) -> str:
-    """检查参考音频时长，返回警告信息"""
-    try:
-        from pydub import AudioSegment
-
-        seg = AudioSegment.from_file(audio_path)
-        dur = len(seg) / 1000.0
-        if dur < 3.0:
-            return f"⚠️ 参考音频仅 {dur:.1f}s，短于推荐时长 3s，克隆质量可能不佳"
-        if dur > 30.0:
-            return f"⚠️ 参考音频长达 {dur:.1f}s，超过推荐时长 30s"
-        return ""
-    except Exception:
-        return ""
-
-
 def generate_speech(
     ref_audio_path: str,
     ref_text: str,
     gen_text: str,
     speed: float = 1.0,
-    nfe_steps: int = 32,
-    cfg_strength: float = 2.5,
     remove_silence: bool = True,
     ref_pt_path: str = None,
+    seed: int = 20260812,
+    progress_cb=None,
 ) -> dict:
     """
-    使用参考音频或预保存的音色特征文件合成任意文本。
+    使用预保存的音色特征文件合成任意文本（唯一调用方为 TTS 异步任务，
+    ref_pt_path 由任务提交方校验后传入；.pt 缺失时 worker 会回退用参考音频懒生成）。
     在独立子进程中加载模型和执行推理，避免模型加载崩溃影响主服务。
-    基于 CosyVoice3，零样本语音克隆，原生支持多语言。
 
     Args:
-        ref_audio_path: 参考音频路径（如果提供了 ref_pt_path，则可为空）
+        ref_audio_path: 参考音频路径（懒生成 .pt 的回退来源，可为空）
         ref_text: 参考音频的文字（需与音频内容匹配）
         gen_text: 要合成的文本
         speed: 语速（0.5-2.0，默认 1.0，CosyVoice3 支持）
-        nfe_steps: (已废弃，保留兼容) 原 F5-TTS 推理步数
-        cfg_strength: (已废弃，保留兼容) 原 F5-TTS CFG 强度
         remove_silence: 是否去除首尾静音
         ref_pt_path: 预保存的音色特征文件路径（.pt），如果提供则优先使用
+        progress_cb: 分片合成进度回调，形如 cb({"done": 2, "total": 5})，可为空
 
     Returns:
         {
             "output_path": "D:/.../xxx.wav",
             "duration_sec": 3.5,
-            "sample_rate": 22050,
+            "sample_rate": 24000,
             "info": "...",
         }
     """
-    import soundfile as sf
-
     # 合成文本校验：过短/纯标点会在模型内触发底层卷积崩溃，提前拦截
     validate_gen_text(gen_text)
 
-    temp_truncated_audio = None
-    if ref_audio_path and os.path.exists(ref_audio_path) and not ref_pt_path:
-        try:
-            info = sf.info(ref_audio_path)
-            if info.duration > MAX_REF_SECONDS:
-                print(f"[TTS] 参考音频时长为 {info.duration:.1f}s，超过{MAX_REF_SECONDS:.0f}秒限制。正在自动截断至前{MAX_REF_SECONDS:.0f}秒以避免 CosyVoice 报错...", flush=True)
-                orig_audio, orig_sr = sf.read(ref_audio_path)
-                max_samples = int(MAX_REF_SECONDS * orig_sr)
-                truncated_audio = orig_audio[:max_samples]
-                
-                # 创建临时截断音频文件
-                temp_truncated_audio = tempfile.mktemp(suffix=".wav", prefix="ref_truncated_")
-                sf.write(temp_truncated_audio, truncated_audio, orig_sr)
-                ref_audio_path = temp_truncated_audio
-        except Exception as e:
-            print(f"[TTS] 自动截断参考音频出错: {e}", flush=True)
+    # 生成输出路径
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_wav = os.path.join(TTS_OUTPUTS_DIR, f"{ts}_{uuid.uuid4().hex[:8]}.wav")
 
+    # 输出目录防膨胀：超过上限时清理最旧文件
     try:
-        # 如果提供了 .pt 文件路径，跳过音频时长检查
-        if ref_pt_path:
-            duration_warn = ""
-        else:
-            duration_warn = _check_duration(ref_audio_path)
-
-        # 生成输出路径
-        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_wav = os.path.join(TTS_OUTPUTS_DIR, f"{ts}_{uuid.uuid4().hex[:8]}.wav")
-
-        # 输出目录防膨胀：超过上限时清理最旧文件
-        try:
-            files = sorted(
-                (os.path.join(TTS_OUTPUTS_DIR, f) for f in os.listdir(TTS_OUTPUTS_DIR) if f.endswith(".wav")),
-                key=os.path.getmtime,
-            )
-            while len(files) > MAX_OUTPUT_FILES:
-                old = files.pop(0)
-                os.remove(old)
-                print(f"[TTS] 已清理旧输出: {old}", flush=True)
-        except Exception as e:
-            print(f"[TTS] 输出目录清理跳过: {e}", flush=True)
-
-        result = _run_tts_with_persistent_worker(
-            ref_audio_path=ref_audio_path,
-            ref_text=ref_text,
-            gen_text=gen_text,
-            speed=speed,
-            nfe_steps=nfe_steps,
-            cfg_strength=cfg_strength,
-            remove_silence=remove_silence,
-            out_wav=out_wav,
-            ref_pt_path=ref_pt_path,
+        files = sorted(
+            (os.path.join(TTS_OUTPUTS_DIR, f) for f in os.listdir(TTS_OUTPUTS_DIR) if f.endswith(".wav")),
+            key=os.path.getmtime,
         )
+        while len(files) > MAX_OUTPUT_FILES:
+            old = files.pop(0)
+            os.remove(old)
+            print(f"[TTS] 已清理旧输出: {old}", flush=True)
+    except Exception as e:
+        print(f"[TTS] 输出目录清理跳过: {e}", flush=True)
 
-        if "error" in result:
-            raise RuntimeError(f"TTS 合成失败: {result['error']}")
+    result = _run_tts_with_persistent_worker(
+        ref_audio_path=ref_audio_path,
+        ref_text=ref_text,
+        gen_text=gen_text,
+        speed=speed,
+        remove_silence=remove_silence,
+        out_wav=out_wav,
+        ref_pt_path=ref_pt_path,
+        seed=seed,
+        progress_cb=progress_cb,
+    )
 
-        duration_sec = result.get("duration_sec", 0)
-        sample_rate = result.get("sample_rate", 24000)
+    duration_sec = result.get("duration_sec", 0)
+    sample_rate = result.get("sample_rate", 24000)
 
-        info = f"✅ 合成完成 | 时长={duration_sec:.2f}s | 采样率={sample_rate}Hz"
-        if duration_warn:
-            info = duration_warn + "\n\n" + info
+    ret = {
+        "output_path": result["output_path"],
+        "duration_sec": duration_sec,
+        "sample_rate": sample_rate,
+        "info": f"✅ 合成完成 | 时长={duration_sec:.2f}s | 采样率={sample_rate}Hz",
+    }
 
-        ret = {
-            "output_path": result["output_path"],
-            "duration_sec": duration_sec,
-            "sample_rate": sample_rate,
-            "info": info,
-        }
+    # 如果 worker 懒生成了 .pt 文件，传递路径给调用方（用于回写数据库）
+    if result.get("generated_pt_path"):
+        ret["generated_pt_path"] = result["generated_pt_path"]
 
-        # 如果 worker 懒生成了 .pt 文件，传递路径给调用方（用于回写数据库）
-        if result.get("generated_pt_path"):
-            ret["generated_pt_path"] = result["generated_pt_path"]
-
-        return ret
-    finally:
-        if temp_truncated_audio and os.path.exists(temp_truncated_audio):
-            try:
-                os.remove(temp_truncated_audio)
-            except Exception:
-                pass
+    return ret
 
 
 def _start_tts_worker():
@@ -916,6 +871,8 @@ def _start_tts_worker():
 
         time.sleep(0.5)
 
+    # server-ready 后由常驻 reader 线程接管 stdout（路由响应/进度到各请求）
+    _start_reader_thread(proc)
     return proc
 
 
@@ -942,70 +899,19 @@ def _kill_worker(proc):
 def preload_worker(timeout_sec: int = 300):
     """
     预加载模型：启动 worker 并等待模型加载完成。
-    由后端启动时在后台线程调用，不阻塞 API；失败时首次合成会自动加载兜底。
-    整个流程持 _worker_lock，与合成/存音色请求串行，避免 stdin 交错。
+    由后端启动时在后台线程调用，不阻塞 API；失败时首次合成会自动加载兜底
+    （不抛错、不杀进程），与合成/存音色请求经 task_lock 串行。
     """
-    import time
-    import threading
-    import queue
-
-    global _worker_model_loaded
-    payload = {"action": "preload"}
     try:
-        with _worker_lock:
-            proc = _ensure_worker()
-            if not proc.stdin or not proc.stdout:
-                raise RuntimeError("TTS worker 管道不可用")
-
-            start_time = time.time()
-            result_queue = queue.Queue(maxsize=1)
-            stop_event = threading.Event()
-
-            def read_results():
-                try:
-                    while not stop_event.is_set():
-                        line = proc.stdout.readline()
-                        if not line:
-                            if proc.poll() is not None:
-                                break
-                            time.sleep(0.1)
-                            continue
-                        line = line.strip()
-                        if line.startswith("{"):
-                            try:
-                                result_queue.put(json.loads(line), timeout=1.0)
-                            except (json.JSONDecodeError, queue.Full):
-                                pass
-                except Exception as e:
-                    print(f"[TTS] 预加载 Reader error: {e}", flush=True)
-
-            reader = threading.Thread(target=read_results)
-            reader.daemon = True
-            reader.start()
-
-            try:
-                proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-                proc.stdin.flush()
-                while True:
-                    elapsed = time.time() - start_time
-                    if elapsed > timeout_sec:
-                        print("[TTS] ⚠️ 模型预加载超时，将在首次合成时自动加载", flush=True)
-                        break
-                    try:
-                        result = result_queue.get(timeout=0.5)
-                        if "error" in result:
-                            print(f"[TTS] ⚠️ 模型预加载失败: {result['error']}", flush=True)
-                        else:
-                            _worker_model_loaded = True
-                            print("[TTS] ✅ 模型预加载完成，可直接开始合成", flush=True)
-                        break
-                    except queue.Empty:
-                        if proc.poll() is not None:
-                            print("[TTS] ⚠️ worker 进程在预加载期间退出，将在首次合成时重建", flush=True)
-                            break
-            finally:
-                stop_event.set()
-                reader.join(timeout=2.0)
+        _worker_request(
+            {"action": "preload"},
+            timeout_sec=timeout_sec,
+            label="模型预加载",
+            raise_on_failure=False,
+            kill_on_timeout=False,
+        )
+        if _worker_model_loaded:
+            print("[TTS] ✅ 模型预加载完成，可直接开始合成", flush=True)
     except Exception as e:
         print(f"[TTS] ⚠️ 模型预加载异常（首次合成时自动加载）: {e}", flush=True)
 
@@ -1015,106 +921,35 @@ def _run_tts_with_persistent_worker(
     ref_text: str,
     gen_text: str,
     speed: float,
-    nfe_steps: int,
-    cfg_strength: float,
     remove_silence: bool,
     out_wav: str,
     timeout_sec: int = 900,
     ref_pt_path: str = None,
+    seed: int = 20260812,
+    progress_cb=None,
 ) -> dict:
-    import time
-    import threading
-    import queue
-
+    """向 worker 发送语音合成请求并等待结果（进度行经 progress_cb 转发）"""
     payload = {
         "ref_audio_path": ref_audio_path,
         "ref_text": ref_text,
         "gen_text": gen_text,
         "speed": speed,
-        "nfe_steps": int(nfe_steps),
-        "cfg_strength": cfg_strength,
         "remove_silence": remove_silence,
         "output_path": out_wav,
+        "seed": int(seed),
     }
-    
-    # 如果提供了 .pt 音色特征文件路径，则添加到 payload
     if ref_pt_path:
         payload["ref_pt_path"] = ref_pt_path
 
-    # 获取 TTS 锁
-    from services.task_lock import acquire_tts_lock, release_tts_lock
-    
-    if not acquire_tts_lock(description="语音合成"):
-        raise RuntimeError("有其他语音合成任务正在进行中，请稍后重试")
-    
-    try:
-        with _worker_lock:
-            proc = _ensure_worker()
-            if not proc.stdin or not proc.stdout:
-                raise RuntimeError("TTS worker 管道不可用")
-
-            start_time = time.time()
-            # 写入必须持锁（与预加载/其他请求串行，避免 stdin 交错）
-            proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            proc.stdin.flush()
-        result_queue = queue.Queue(maxsize=1)
-        stop_event = threading.Event()
-
-        def read_results():
-            try:
-                while not stop_event.is_set():
-                    proc.stdout.flush()
-                    line = proc.stdout.readline()
-                    if not line:
-                        if proc.poll() is not None:
-                            break
-                        time.sleep(0.1)
-                        continue
-                    line = line.strip()
-                    if line.startswith("{"):
-                        try:
-                            # 在 reader 线程内完成 JSON 解析，解析失败不会影响主线程
-                            result_queue.put(json.loads(line), timeout=1.0)
-                        except (json.JSONDecodeError, queue.Full):
-                            pass
-            except Exception as e:
-                print(f"[TTS] Reader error: {e}", flush=True)
-
-        # Start reader thread
-        reader = threading.Thread(target=read_results)
-        reader.daemon = True
-        reader.start()
-
-        try:
-            # Wait for result with timeout
-            # （请求写入已在 _worker_lock 内完成，见上方锁块）
-            while True:
-                elapsed = time.time() - start_time
-                if elapsed > timeout_sec:
-                    # 超时大概率是 worker 内部卡死（模型死锁/音频异常），
-                    # 直接杀掉进程让下次请求重建，避免卡死请求持续堆积
-                    _kill_worker(proc)
-                    raise RuntimeError(f"TTS 合成超时（{timeout_sec}s），worker 已重启，请尝试减少文本长度")
-
-                try:
-                    result = result_queue.get(timeout=0.5)
-                    if "error" in result:
-                        raise RuntimeError(f"TTS 合成失败: {result['error']}")
-                    global _worker_model_loaded
-                    _worker_model_loaded = True
-                    return result
-                except queue.Empty:
-                    if proc.poll() is not None:
-                        raise RuntimeError("TTS worker 进程已退出")
-        finally:
-            # Signal reader to stop
-            stop_event.set()
-            # Give reader thread a moment to clean up
-            reader.join(timeout=2.0)
-    finally:
-        # 释放 TTS 锁
-        release_tts_lock()
-
+    result = _worker_request(
+        payload,
+        timeout_sec=timeout_sec,
+        label="语音合成",
+        progress_cb=progress_cb,
+    )
+    if result is None:
+        raise RuntimeError("语音合成失败：worker 未返回结果")
+    return result
 
 @atexit.register
 def _shutdown_worker():

@@ -170,6 +170,9 @@
                                             formatSec(v.ref_duration)
                                         }}
                                     </div>
+                                    <div class="voice-duration" :class="v.ref_pt_exists ? 'feature-ready' : 'feature-missing'">
+                                        音色特征：{{ v.ref_pt_exists ? '已就绪' : '缺失' }}
+                                    </div>
                                 </div>
                                 <div class="voice-actions">
                                     <el-button
@@ -343,6 +346,14 @@
                                                     v-model="
                                                         synthForm.remove_silence
                                                     "
+                                                />
+                                            </el-form-item>
+                                            <el-form-item label="随机种子">
+                                                <el-input-number
+                                                    v-model="synthForm.seed"
+                                                    :min="0"
+                                                    :max="2147483647"
+                                                    controls-position="right"
                                                 />
                                             </el-form-item>
                                         </el-collapse-item>
@@ -641,7 +652,6 @@ function togglePreview(v) {
 
 // ── 语音合成 ────────────────────────────────────────────
 const synthesizing = ref(false);
-const synthPercent = ref(0);
 const synthAnimPercent = ref(0);
 const elapsedSec = ref(0);
 const audioUrl = ref("");
@@ -649,22 +659,29 @@ const audioRef = ref();
 const resultDuration = ref("");
 const resultSampleRate = ref("");
 const resultFilename = ref("");
-const synthObjectUrl = ref("");
 
 const currentTaskId = ref("");
 const taskMessage = ref("");
 let pollingTimer = null;
 
 let _elapsedTimer = null;
-let _animTimer = null;
+
+// 后端是否已上报真实分片进度（收到后不再推进假动画进度）
+const realProgressSeen = ref(false);
+// 恢复跟踪进行中任务的最长轮询时长：服务重启可能留下永远停在
+// processing 的僵尸任务，超过该时长停止轮询并提示用户
+const RESUME_POLL_MAX_MS = 30 * 60 * 1000;
+let resumeDeadline = 0;
 
 function _startElapsedTimer() {
     elapsedSec.value = 0;
+    realProgressSeen.value = false;
     synthAnimPercent.value = 5;
     _elapsedTimer = setInterval(() => {
         elapsedSec.value++;
-        // 动画进度：缓慢爬升到最多 90%，让用户感知进展
-        if (synthAnimPercent.value < 90) {
+        // 动画进度：缓慢爬升到最多 90%，让用户感知进展；
+        // 收到后端真实分片进度后交由真实进度驱动
+        if (!realProgressSeen.value && synthAnimPercent.value < 90) {
             const step = synthAnimPercent.value < 30 ? 3 : synthAnimPercent.value < 60 ? 1.5 : 0.5;
             synthAnimPercent.value = Math.min(90, synthAnimPercent.value + step);
         }
@@ -684,16 +701,114 @@ const synthForm = ref({
     gen_text: "",
     speed: 1.2,  // 与后端默认值保持一致（用户要求默认 1.2 倍速）
     remove_silence: true,
+    seed: 20260812,
 });
 
 const canSynthesize = computed(() => {
     return synthForm.value.voice_name && synthForm.value.gen_text.trim();
 });
 
+/**
+ * 轮询任务状态直至完成/失败。
+ * @param {string} taskId 任务ID
+ * @param {boolean} resumed 是否为刷新页面后恢复的跟踪（带僵尸任务超时兜底）
+ */
+function startPolling(taskId, resumed = false) {
+    if (resumed) resumeDeadline = Date.now() + RESUME_POLL_MAX_MS;
+    const _clearPollingTimer = () => {
+        if (pollingTimer) {
+            clearTimeout(pollingTimer);
+            pollingTimer = null;
+        }
+    };
+    const pollOnce = async () => {
+        // 守卫：已经处理过完成/失败/异常，不再继续
+        if (!synthesizing.value) return;
+        try {
+            const taskRes = await ttsAPI.getTaskStatus(taskId);
+            // await 期间状态可能已变更，再次守卫
+            if (!synthesizing.value) return;
+            const status = taskRes.data.status;
+            taskMessage.value = taskRes.data.message || "正在合成中...";
+
+            // 后端返回真实分片进度（0-100）时优先展示
+            if (
+                typeof taskRes.data.progress === "number" &&
+                taskRes.data.progress > 0
+            ) {
+                realProgressSeen.value = true;
+                synthAnimPercent.value = taskRes.data.progress;
+            }
+
+            if (status === "done") {
+                _clearPollingTimer();
+                synthesizing.value = false;
+                _stopElapsedTimer();
+
+                // 加载音频结果
+                if (taskRes.data.result_filename) {
+                    resultFilename.value = taskRes.data.result_filename;
+                    audioUrl.value = `/api/v1/tts/download/${encodeURIComponent(taskRes.data.result_filename)}`;
+                    resultDuration.value = taskRes.data.tts_duration_sec ? taskRes.data.tts_duration_sec.toFixed(2) + "秒" : "未知";
+                    resultSampleRate.value = taskRes.data.sample_rate ? taskRes.data.sample_rate + " Hz" : "24000 Hz";
+                    ElMessage.success("语音合成完成！");
+                } else {
+                    ElMessage.error("未找到生成的音频文件");
+                }
+            } else if (status === "failed") {
+                _clearPollingTimer();
+                synthesizing.value = false;
+                _stopElapsedTimer();
+                ElMessage.error(`合成失败: ${taskRes.data.message}`);
+            } else if (resumed && Date.now() > resumeDeadline) {
+                // 恢复的僵尸任务兜底：长时间无结果则停止跟踪
+                _clearPollingTimer();
+                synthesizing.value = false;
+                _stopElapsedTimer();
+                ElMessage.warning("任务长时间未完成（可能因服务重启中断），请到任务记录页查看");
+            } else {
+                // 仍在处理中，调度下一次查询
+                pollingTimer = setTimeout(pollOnce, 1500);
+            }
+        } catch (err) {
+            console.error("Polling error:", err);
+            // 轮询连续失败时停止轮询并提示，避免无意义的死循环
+            _clearPollingTimer();
+            synthesizing.value = false;
+            _stopElapsedTimer();
+            ElMessage.error("任务状态查询失败，请刷新页面查看任务记录");
+        }
+    };
+    pollingTimer = setTimeout(pollOnce, 1500);
+}
+
+// 页面加载/刷新后恢复跟踪进行中的合成任务（长文本合成需数分钟，刷新不丢跟踪）
+async function resumeRunningTask() {
+    if (synthesizing.value) return;
+    try {
+        const res = await ttsAPI.getHistory({
+            task_type: "tts",
+            page: 1,
+            page_size: 10,
+        });
+        const running = (res.data.items || []).find(
+            (t) => t.status === "pending" || t.status === "processing"
+        );
+        if (!running) return;
+        currentTaskId.value = running.task_id;
+        synthesizing.value = true;
+        taskMessage.value =
+            running.message || "检测到进行中的合成任务，已恢复跟踪...";
+        _startElapsedTimer();
+        startPolling(running.task_id, true);
+    } catch {
+        /* 恢复失败静默处理，不影响页面正常使用 */
+    }
+}
+
 async function startSynthesize() {
     if (!canSynthesize.value) return;
     synthesizing.value = true;
-    synthPercent.value = 0;
     taskMessage.value = "已提交合成任务...";
     _startElapsedTimer();
 
@@ -703,65 +818,13 @@ async function startSynthesize() {
         fd.append("gen_text", synthForm.value.gen_text);
         fd.append("speed", synthForm.value.speed);
         fd.append("remove_silence", synthForm.value.remove_silence);
+        fd.append("seed", synthForm.value.seed);
 
-        // 使用异步任务接口
+        // 使用异步任务接口提交，随后轮询任务状态
+        // （setTimeout 递归轮询，避免上一次查询未完成就触发下一次导致消息重复弹出）
         const res = await ttsAPI.submitTask(fd);
-        const taskId = res.data.task_id;
-        currentTaskId.value = taskId;
-
-        // 开始轮询任务状态
-        // 注意：使用 setTimeout 递归而非 setInterval，避免上一次查询未完成就触发
-        // 下一次导致并发查询，造成 "合成完成" 消息被多次弹出
-        const _clearPollingTimer = () => {
-            if (pollingTimer) {
-                clearTimeout(pollingTimer);
-                pollingTimer = null;
-            }
-        };
-        const pollOnce = async () => {
-            // 守卫：已经处理过完成/失败/异常，不再继续
-            if (!synthesizing.value) return;
-            try {
-                const taskRes = await ttsAPI.getTaskStatus(taskId);
-                // await 期间状态可能已变更，再次守卫
-                if (!synthesizing.value) return;
-                const status = taskRes.data.status;
-                taskMessage.value = taskRes.data.message || "正在合成中...";
-
-                if (status === "done") {
-                    _clearPollingTimer();
-                    synthesizing.value = false;
-                    _stopElapsedTimer();
-
-                    // 加载音频结果
-                    if (taskRes.data.result_filename) {
-                        resultFilename.value = taskRes.data.result_filename;
-                        audioUrl.value = `/api/v1/tts/download/${encodeURIComponent(taskRes.data.result_filename)}`;
-                        resultDuration.value = taskRes.data.tts_duration_sec ? taskRes.data.tts_duration_sec.toFixed(2) + "秒" : "未知";
-                        resultSampleRate.value = taskRes.data.sample_rate ? taskRes.data.sample_rate + " Hz" : "24000 Hz";
-                        ElMessage.success("语音合成完成！");
-                    } else {
-                        ElMessage.error("未找到生成的音频文件");
-                    }
-                } else if (status === "failed") {
-                    _clearPollingTimer();
-                    synthesizing.value = false;
-                    _stopElapsedTimer();
-                    ElMessage.error(`合成失败: ${taskRes.data.message}`);
-                } else {
-                    // 仍在处理中，调度下一次查询
-                    pollingTimer = setTimeout(pollOnce, 1500);
-                }
-            } catch (err) {
-                console.error("Polling error:", err);
-                // 轮询连续失败时停止轮询并提示，避免无意义的死循环
-                _clearPollingTimer();
-                synthesizing.value = false;
-                _stopElapsedTimer();
-                ElMessage.error("任务状态查询失败，请刷新页面查看任务记录");
-            }
-        };
-        pollingTimer = setTimeout(pollOnce, 1500);
+        currentTaskId.value = res.data.task_id;
+        startPolling(res.data.task_id);
 
     } catch (e) {
         console.error('Synthesis error:', e);
@@ -792,18 +855,14 @@ async function downloadAudio() {
 function resetSynth() {
     _stopElapsedTimer();
     synthesizing.value = false;
-    synthPercent.value = 0;
     elapsedSec.value = 0;
     synthAnimPercent.value = 0;
-    if (synthObjectUrl.value) {
-        URL.revokeObjectURL(synthObjectUrl.value);
-        synthObjectUrl.value = "";
-    }
     audioUrl.value = "";
-    synthForm.value.voice_name = "";
+    // 保留已选音色，仅清空文本与结果，方便连续调整文案重新合成
     synthForm.value.gen_text = "";
     synthForm.value.speed = 1.2;
     synthForm.value.remove_silence = true;
+    synthForm.value.seed = 20260812;
 }
 
 // ── 工具 ────────────────────────────────────────────────
@@ -819,9 +878,11 @@ onMounted(async () => {
     await loadTaskStatus();
     await loadVoices();
     // 自动选中第一个音色
-    if (voices.value.length > 0) {
+    if (voices.value.length > 0 && !synthForm.value.voice_name) {
         synthForm.value.voice_name = voices.value[0].name;
     }
+    // 恢复跟踪进行中的合成任务（页面刷新后不丢失进度）
+    resumeRunningTask();
 });
 
 onBeforeUnmount(() => {
@@ -832,9 +893,6 @@ onBeforeUnmount(() => {
     }
     if (previewObjectUrl.value) {
         URL.revokeObjectURL(previewObjectUrl.value);
-    }
-    if (synthObjectUrl.value) {
-        URL.revokeObjectURL(synthObjectUrl.value);
     }
 });
 </script>

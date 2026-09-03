@@ -71,6 +71,12 @@ async def ensure_schema():
         cols = {r[1] for r in rows}
         if "elapsed_sec" not in cols:
             await conn.execute(text("ALTER TABLE task_records ADD COLUMN elapsed_sec FLOAT"))
+        # task_records.seed：TTS 推理随机种子，用于复现生成结果
+        if "seed" not in cols:
+            await conn.execute(text("ALTER TABLE task_records ADD COLUMN seed INTEGER"))
+        # task_records.progress：分片合成进度（0-100）
+        if "progress" not in cols:
+            await conn.execute(text("ALTER TABLE task_records ADD COLUMN progress INTEGER"))
 
 
 # 关键：在此处导入所有模型，确保 relationship 字符串引用能正确解析
