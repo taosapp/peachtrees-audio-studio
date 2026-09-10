@@ -6,7 +6,8 @@ const routes = [
     component: () => import('@/layouts/MainLayout.vue'),
     children: [
       { path: '', redirect: '/clone' },
-      { path: 'clone',     name: 'Clone',     component: () => import('@/views/VoiceClone.vue') },
+      { path: 'clone',     name: 'Clone',     component: () => import('@/views/SoundClone.vue') },
+      { path: 'tts',       name: 'Tts',       component: () => import('@/views/TtsSynthesize.vue') },
       { path: 'tasks',     name: 'Tasks',     component: () => import('@/views/Tasks.vue') },
     ]
   },

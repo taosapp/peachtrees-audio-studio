@@ -4,7 +4,7 @@
     <el-aside :width="isCollapsed ? '64px' : '220px'" class="sidebar">
       <div class="logo" @click="router.push('/clone')">
         <span class="logo-icon">🍑</span>
-        <span v-if="!isCollapsed" class="logo-text">PeachTrees</span>
+        <span v-if="!isCollapsed" class="logo-text">PeachTrees<br />Studio</span>
       </div>
 
       <el-menu
@@ -20,6 +20,10 @@
         <el-menu-item index="/clone">
           <el-icon><User /></el-icon>
           <template #title>声音克隆</template>
+        </el-menu-item>
+        <el-menu-item index="/tts">
+          <el-icon><ChatLineSquare /></el-icon>
+          <template #title>文字转语音</template>
         </el-menu-item>
         <el-menu-item index="/tasks">
           <el-icon><List /></el-icon>
@@ -63,6 +67,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
+import { User, List, ChatLineSquare, Fold, Expand } from '@element-plus/icons-vue'
 
 const router = useRouter()
 const route = useRoute()
@@ -72,6 +77,7 @@ const activeMenu = computed(() => route.path)
 
 const pageTitles = {
   '/clone': '声音克隆',
+  '/tts': '文字转语音',
   '/tasks': '任务记录',
 }
 const currentPageTitle = computed(() => {

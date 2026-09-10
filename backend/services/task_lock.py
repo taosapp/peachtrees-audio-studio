@@ -3,7 +3,13 @@
 合成/音色特征提取任务占用推理进程。
 """
 import threading
+from datetime import datetime
 from typing import Optional
+
+
+def _now_iso() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 
 _tts_lock = threading.Lock()
 
@@ -20,6 +26,7 @@ def acquire_tts_lock(task_type: str = "tts", description: str = "") -> bool:
         "task_type": task_type,
         "task_id": None,
         "description": description,
+        "acquired_at": _now_iso(),
     }
     return True
 
@@ -49,4 +56,5 @@ def get_all_task_status() -> dict:
     return {
         "tts_running": is_tts_running(),
         "current_task": get_current_task(),
+        "tts_running_since": (get_current_task() or {}).get("acquired_at"),
     }

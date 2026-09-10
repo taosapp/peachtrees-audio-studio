@@ -55,10 +55,12 @@ def _get_tts_status() -> ModelStatus:
                     pass
 
                 if task_status.get("tts_running"):
+                    _current = task_status.get("current_task") or {}
+                    _desc = _current.get("description") or "语音合成"
                     return ModelStatus(
                         name="CosyVoice3",
                         loaded=True,
-                        message="正在合成语音中..."
+                        message=f"正在{_desc}中...",
                     )
                 if worker_loaded:
                     return ModelStatus(

@@ -456,6 +456,12 @@ def _worker_request(
 
     from services.task_lock import acquire_tts_lock, release_tts_lock
 
+    # 锁外确保 worker 已就绪：模型加载（最长 180s）不占用 TTS 锁，
+    # 避免首次加载期间前端误报"正在合成"、其他请求误报"任务进行中"。
+    # worker 启动互斥由 _worker_lock 保证，两个并发请求不会重复启动进程。
+    with _worker_lock:
+        _ensure_worker()
+
     if not acquire_tts_lock(description=label):
         raise RuntimeError("有其他语音合成任务正在进行中，请稍后重试")
 
