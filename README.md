@@ -1,36 +1,92 @@
-# PeachTrees Media Studio 声音克隆系统 (v2.2)
+# PeachTrees Media Studio 声音克隆系统
 
 本项目已重构净化为 **极简单用户声音克隆与合成系统**。移除了旧版本中的视频字幕生成（ASR）、Redis/ARQ 队列依赖、身份注册/登录及多用户账单等冗余模块，让运行资源和体验达到最轻量状态。
 
+支持 **Windows、macOS、Linux XFCE** 三平台，采用「壳+webserver」架构，可选 Electron 桌面壳。
+
 ---
 
-## 🚀 1. 快速启动与管理（Windows 双击即用）
+## 🚀 1. 快速启动与管理
 
-为方便用户及移植到其他设备，项目根目录下已内置完备的批处理管理脚本：
+### Windows
 
-### 第一步：一键安装依赖
+#### 第一步：一键安装依赖
 *   **直接双击运行根目录下的 `install_deps.bat`**。
 *   脚本会自动检测 Python/pip 环境，并为您提供 [1] GPU (Nvidia CUDA) 或 [2] CPU 运行硬件选择。
 *   选择后将自动拉起最新适配的 PyTorch 并以清华国内源极速完成核心业务及 CosyVoice3 模型全部运行依赖的安装。
 
-### 第二步：一键启动/管理服务
-*   **直接双击运行根目录下的 `manage.bat`**。
-*   打开后会呈现交互式中文管理菜单，输入对应选项（1-5）并回车：
-    *   `[1] 启动前后端服务`：会自动清理残留进程并分别弹出独立的后端与前端运行窗口（便于排查和查看实时日志）。
-    *   `[2] 关闭前后端服务`：强力终止后台占用的 `8000` (后端) 和 `5173` (前端) 进程树并自动关闭窗口。
-    *   `[3] 重启前后端服务`：一键关闭并重新拉起最新服务。
-    *   `[4] 查看服务运行状态`：实时显示当前端口占用 PID 及访问链接。
-    *   `[5] 退出管理器`。
+#### 第二步：构建前端（首次或前端更新后）
+```powershell
+python manage.py build
+```
+该命令会将 Vue3 前端构建到 `backend/static/`，由后端 FastAPI 静态托管，无需独立前端进程。
+
+#### 第三步：启动/管理服务
+```powershell
+python manage.py start    # 启动后端服务（前端已由后端托管）
+python manage.py stop     # 关闭后端服务
+python manage.py restart  # 重启后端服务
+python manage.py status   # 查看服务运行状态
+```
+
+启动后访问 `http://localhost:8000` 即可使用声音克隆/合成控制台。
+
+### macOS / Linux
+
+#### 第一步：一键安装依赖
+```bash
+chmod +x install_deps.sh
+./install_deps.sh
+```
+脚本会自动检测包管理器（brew/apt/dnf/yum/pacman）并安装 FFmpeg 和 Python 依赖。
+macOS 用户可选择 MPS（Apple Silicon GPU）模式，Linux 用户可选择 CUDA 或 CPU 模式。
+
+#### 第二步：构建前端
+```bash
+python3 manage.py build
+```
+
+#### 第三步：启动服务
+```bash
+python3 manage.py start
+```
+
+#### 可选：创建桌面快捷方式（Linux XFCE）
+将 `peachtrees-media-studio.desktop` 复制到 `~/.local/share/applications/`，修改其中的 `Path` 和 `Exec` 为实际项目路径。
+
+### Electron 桌面壳（可选）
+
+项目内置 Electron 壳，可将 Web 应用包装为原生桌面应用：
+
+```powershell
+cd electron-shell
+npm install
+# Windows 下需设置镜像下载 Electron 二进制
+$env:ELECTRON_MIRROR="https://npmmirror.com/mirrors/electron/"
+node node_modules/electron/install.js
+
+# 启动（需先完成上述依赖安装和前端构建）
+cd ..
+./start_electron.bat    # Windows
+# 或 cd electron-shell && npx electron . --dev
+```
+
+启动后 Electron 壳会自动拉起 Python 后端，显示启动向导，后端就绪后加载主界面。
 
 ---
 
 ## ⚙️ 2. 环境配置 (`backend/.env`)
 
-**v2.3 起仅支持 SQLite，零配置**：数据库文件自动创建于 `backend/data/pt_media_studio.db`，无需安装任何数据库服务：
+**仅支持 SQLite，零配置**：数据库文件自动创建于 `backend/data/pt_media_studio.db`，无需安装任何数据库服务：
 
 ```ini
 DATABASE_URL=sqlite+aiosqlite:///D:/ai/peachtreesMediaStudio/backend/data/pt_media_studio.db
 ```
+
+平台配置模板位于 `backend/` 目录，复制为 `.env` 后按实际路径修改：
+*   `.env.windows` - Windows 配置模板
+*   `.env.macos` - macOS 配置模板（MPS 优化）
+*   `.env.linux` - Linux 配置模板
 
 其他可配置项：
 
@@ -39,7 +95,7 @@ DATABASE_URL=sqlite+aiosqlite:///D:/ai/peachtreesMediaStudio/backend/data/pt_med
 | `MAX_UPLOAD_MB` | 50 | 参考音频上传大小上限（MB） |
 | `MAX_REF_SECONDS` | 15 | 参考音频最大时长（秒），超出自动截断 |
 | `MAX_OUTPUT_FILES` | 500 | 合成输出目录保留文件数，超出自动清理 |
-| `TTS_NUM_THREADS` | 4 | CPU 推理线程数（0=torch 默认） |
+| `TTS_NUM_THREADS` | 4 | CPU 推理线程数（0=torch 默认，macOS MPS 建议设为 0） |
 
 ---
 
@@ -49,60 +105,96 @@ DATABASE_URL=sqlite+aiosqlite:///D:/ai/peachtreesMediaStudio/backend/data/pt_med
 
 | 模块 | 地址 | 说明 |
 |------|------|------|
-| **前端 Web 界面** | [http://localhost:5173](http://localhost:5173) | 声音克隆/合成控制台 |
+| **Web 界面** | [http://localhost:8000](http://localhost:8000) | 声音克隆/合成控制台（FastAPI 静态托管） |
 | **后端 API 文档** | [http://localhost:8000/docs](http://localhost:8000/docs) | Swagger API 交互调试文档 |
-| **API 根路径** | [http://localhost:8000](http://localhost:8000) | 后端服务根目录 |
+| **健康检查** | [http://localhost:8000/health](http://localhost:8000/health) | 后端服务健康状态 |
 
 ---
 
 ## 📁 4. 目录结构说明
 
-经过深度精简和无用文件物理删除后，项目目录结构如下：
-
 ```text
 peachtreesMediaStudio/
-├── README.md               # 本启动指南
-├── install_deps.bat        # Windows 依赖一键安装工具（支持 GPU / CPU 选择）
-├── manage.bat              # Windows 服务一键管理工具（图形菜单，支持启/停/重启/状态）
-├── manage.py               # 核心跨平台服务管理控制脚本
+├── README.md                       # 本启动指南
+├── 改造文档.md                      # 跨平台改造完整方案与验收标准
+├── install_deps.bat                 # Windows 依赖一键安装工具（支持 GPU / CPU 选择）
+├── install_deps.sh                  # Linux/macOS 依赖安装脚本（支持 MPS / CUDA / CPU）
+├── start_electron.bat               # Windows Electron 壳一键启动脚本
+├── peachtrees-media-studio.desktop  # Linux XFCE 桌面快捷方式模板
+├── manage.py                        # 跨平台服务管理脚本（start/stop/restart/status/build）
 │
-├── backend/                # 后端 FastAPI 根目录
-│   ├── main.py             # FastAPI 入口服务
-│   ├── init_voices.py      # 运行时音色库目录初始化
-│   ├── tts_infer_worker.py # CosyVoice3 独立进程持久化推理 Worker
-│   ├── requirements.txt    # 后端及 CosyVoice3/Matcha 完整包依赖定义
-│   ├── .env                # 配置文件（已优化为 127.0.0.1 连接）
-│   ├── core/               # 核心支撑模块（数据库连接/常量配置）
-│   ├── models/             # 精简后的 ORM 实体（仅保留 voices、task_records 表）
-│   ├── api/v1/             # API 控制器（精简为：tts 合成、tasks 任务队列管理、models 状态）
-│   ├── services/           # 核心业务服务（tts_service：内嵌防崩溃及 15 秒时长自动截断防崩机制）
-│   ├── models/CosyVoice/   # 预训练 CosyVoice3 权重目录（~7.2 GB，模型文件请在此放置）
-│   ├── voices/             # 用户上传并提取生成的音色克隆库（保存 .wav 剪质及 .pt 特征）
-│   └── tts_outputs/        # 运行时合成音频输出文件夹
+├── backend/                         # 后端 FastAPI 根目录
+│   ├── main.py                      # FastAPI 入口服务（含 SPA 静态托管）
+│   ├── init_voices.py               # 运行时音色库目录初始化
+│   ├── tts_infer_worker.py          # CosyVoice3 独立进程持久化推理 Worker
+│   ├── requirements.txt             # 后端及 CosyVoice3/Matcha 完整包依赖定义（含平台标记）
+│   ├── .env                         # 配置文件（从平台模板复制）
+│   ├── core/                        # 核心支撑模块
+│   │   ├── config.py                # 配置（pydantic-settings）
+│   │   ├── database.py              # 数据库连接（SQLite + aiosqlite）
+│   │   └── platform.py              # 跨平台抽象层（FFmpeg/端口/Python 探测）
+│   ├── models/                      # ORM 实体（voices、task_records 表）
+│   ├── api/v1/                      # API 控制器（tts 合成、tasks 任务管理、models 状态）
+│   ├── services/                    # 核心业务服务（tts_service）
+│   ├── static/                      # 前端构建产物（由 manage.py build 生成，git 忽略）
+│   ├── models/CosyVoice/            # 预训练 CosyVoice3 权重目录（~7.2 GB，需手动放置）
+│   ├── voices/                      # 用户上传并提取生成的音色克隆库
+│   └── tts_outputs/                 # 运行时合成音频输出文件夹
 │
-└── frontend/               # 前端 Vue3 根目录
+├── frontend/                        # 前端 Vue3 根目录
+│   ├── src/
+│   │   ├── main.js                  # 前端应用入口
+│   │   ├── router/index.js          # Vue Router 路由配置
+│   │   ├── layouts/                 # 主侧边栏布局组件
+│   │   ├── api/                     # Axios 请求封装组件
+│   │   └── views/                   # 视图文件夹（Dashboard、VoiceClone、Tasks）
+│   ├── vite.config.js              # Vite 构建配置（输出到 backend/static/）
+│   └── package.json                 # 前端依赖配置
+│
+└── electron-shell/                  # Electron 桌面壳（可选）
     ├── src/
-    │   ├── main.js         # 前端应用入口
-    │   ├── router/index.js # Vue Router 路由配置（已切除鉴权/登录路由守卫）
-    │   ├── layouts/        # 主侧边栏布局组件（剔除个人设置、字幕等导航）
-    │   ├── api/            # Axios 请求封装组件
-    │   └── views/          # 视图文件夹（Dashboard、VoiceClone、Tasks 任务记录页）
-    ├── vite.config.js      # Vite 构建配置
-    └── package.json        # 前端依赖配置
+    │   ├── main.js                  # 主进程（窗口/托盘/Python 子进程管理）
+    │   ├── preload.cjs              # 预加载脚本（安全 IPC）
+    │   └── native-ui/
+    │       └── setup-wizard.html    # 启动向导（后端就绪前展示）
+    ├── build/                       # 图标资源
+    └── package.json                 # Electron 壳依赖配置
 ```
 
 ---
 
-## 💡 5. 常见问题解答 (FAQ)
+## 🌍 5. 跨平台支持
+
+| 平台 | 后端 | FFmpeg | PyTorch | 桌面壳 |
+|---|---|---|---|---|
+| **Windows** | ✅ 已验证 | WinGet / imageio-ffmpeg | CUDA / CPU | ✅ 已验证 |
+| **macOS** | ✅ 代码就绪 | Homebrew | MPS / CPU | 代码就绪 |
+| **Linux XFCE** | ✅ 代码就绪 | apt/dnf/yum/pacman | CUDA / CPU | 代码就绪 |
+
+跨平台实现要点：
+*   `backend/core/platform.py` 统一封装平台检测、FFmpeg 查找、端口进程管理
+*   `tts_service.py` / `tts_infer_worker.py` 的 triton monkey-patch 对非 Linux 平台生效
+*   `requirements.txt` 使用 `sys_platform` 标记实现按平台安装依赖
+*   前端构建为静态文件由 FastAPI 托管，消除前端进程依赖
+
+---
+
+## 💡 6. 常见问题解答 (FAQ)
 
 ### Q1：为什么我点击合成提示 `AssertionError`？
 本系统已在 `save_voice` 录入层和 `generate_speech` 推理层内嵌了 **参考音频自动截断保护（15秒）**。若您使用极个别外部导入的超长音频，系统会在开始合成前自动将其裁切到前 15s 以绕开 CosyVoice 底层 30s 提取限制，**确保您在任何时候合成都不再报错崩溃**。
 
 ### Q2：如何备份我克隆的音色？
-您只需将 `backend/voices/` 目录下的所有文件以及数据库文件（SQLite 为 `backend/data/pt_media_studio.db`，MySQL 为 `voices` 表）一起备份，即可完美移植备份到任意其他设备。
+您只需将 `backend/voices/` 目录下的所有文件以及数据库文件（SQLite 为 `backend/data/pt_media_studio.db`）一起备份，即可完美移植备份到任意其他设备。
 
 ### Q3：参考文字必须手动输入吗？
-是的。v2.2 起已彻底移除 Whisper 自动转录依赖，参考文字必须手动填写且与参考音频内容完全一致，否则克隆音色会失真。
+是的。参考文字必须手动填写且与参考音频内容完全一致，否则克隆音色会失真。
 
 ### Q4：上传的音频有大小限制吗？
 参考音频上传上限默认 50MB（`MAX_UPLOAD_MB` 可调），仅支持常见音频格式（wav/mp3/flac/m4a/aac/ogg/opus/wma/webm），超长音频会自动截断至 15 秒。
+
+### Q5：启动后访问 8000 端口显示 JSON 而非界面？
+前端未构建。运行 `python manage.py build` 构建前端到 `backend/static/`，然后重启服务。
+
+### Q6：macOS 上 PyTorch 如何选择？
+macOS 不支持 CUDA，但支持 MPS（Apple Silicon GPU 加速）。运行 `install_deps.sh` 时选择选项 [3] 即可安装 MPS 兼容版本。`TTS_NUM_THREADS` 建议设为 0，由 torch 自行管理 MPS 并行度。
