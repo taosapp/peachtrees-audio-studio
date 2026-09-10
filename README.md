@@ -1,6 +1,6 @@
-# PeachTrees Media Studio 声音克隆系统
+# PeachTrees Audio Studio
 
-本项目已重构净化为 **极简单用户声音克隆与合成系统**。移除了旧版本中的视频字幕生成（ASR）、Redis/ARQ 队列依赖、身份注册/登录及多用户账单等冗余模块，让运行资源和体验达到最轻量状态。
+本应用有2个功能 **声音克隆、文本转语音**。主要功能已实现，仍在开发中，并未正式发布版本。
 
 支持 **Windows、macOS、Linux XFCE** 三平台，采用「壳+webserver」架构，可选 Electron 桌面壳。
 
@@ -181,20 +181,14 @@ peachtreesMediaStudio/
 
 ## 💡 6. 常见问题解答 (FAQ)
 
-### Q1：为什么我点击合成提示 `AssertionError`？
-本系统已在 `save_voice` 录入层和 `generate_speech` 推理层内嵌了 **参考音频自动截断保护（15秒）**。若您使用极个别外部导入的超长音频，系统会在开始合成前自动将其裁切到前 15s 以绕开 CosyVoice 底层 30s 提取限制，**确保您在任何时候合成都不再报错崩溃**。
-
-### Q2：如何备份我克隆的音色？
+### Q1：如何备份我克隆的音色？
 您只需将 `backend/voices/` 目录下的所有文件以及数据库文件（SQLite 为 `backend/data/pt_media_studio.db`）一起备份，即可完美移植备份到任意其他设备。
 
-### Q3：参考文字必须手动输入吗？
+### Q2：参考文字必须手动输入吗？
 是的。参考文字必须手动填写且与参考音频内容完全一致，否则克隆音色会失真。
 
-### Q4：上传的音频有大小限制吗？
+### Q3：上传的音频有大小限制吗？
 参考音频上传上限默认 50MB（`MAX_UPLOAD_MB` 可调），仅支持常见音频格式（wav/mp3/flac/m4a/aac/ogg/opus/wma/webm），超长音频会自动截断至 15 秒。
 
-### Q5：启动后访问 8000 端口显示 JSON 而非界面？
-前端未构建。运行 `python manage.py build` 构建前端到 `backend/static/`，然后重启服务。
-
-### Q6：macOS 上 PyTorch 如何选择？
+### Q4：macOS 上 PyTorch 如何选择？
 macOS 不支持 CUDA，但支持 MPS（Apple Silicon GPU 加速）。运行 `install_deps.sh` 时选择选项 [3] 即可安装 MPS 兼容版本。`TTS_NUM_THREADS` 建议设为 0，由 torch 自行管理 MPS 并行度。
