@@ -1,5 +1,6 @@
 @echo off
-:: PeachTrees Media Studio - 依赖自动安装脚本
+:: PeachTrees Media Studio - Windows 依赖自动安装脚本
+:: 跨平台安装脚本请使用 install_deps.sh（Linux/macOS）
 chcp 65001 >nul
 title PeachTrees 依赖安装程序
 

@@ -1,6 +1,11 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
+import path from 'node:path'
+
+// 跨平台推导 backend/static 绝对路径
+const projectRoot = path.resolve(__dirname, '..')
+const staticDir = path.join(projectRoot, 'backend', 'static')
 
 export default defineConfig({
   plugins: [vue()],
@@ -8,6 +13,10 @@ export default defineConfig({
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url))
     }
+  },
+  build: {
+    outDir: staticDir,    // 阶段2：构建产物直接写入 backend/static，由 FastAPI 托管
+    emptyOutDir: true,   // 构建前清空目录，避免残留旧文件
   },
   server: {
     port: 5173,

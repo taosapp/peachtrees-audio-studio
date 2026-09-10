@@ -25,8 +25,9 @@ _tts_threads = int(_settings.tts_num_threads or 0)
 if _tts_threads > 0:
     torch.set_num_threads(_tts_threads)
 
-# ── triton monkey-patch（Windows 不支持 triton）────────────────────────────
-if sys.platform == "win32":
+# ── triton monkey-patch（Windows/macOS 不支持 triton）────────────────────────────
+# Linux 原生支持 triton，无需 mock；macOS 与 Windows 同样需要
+if sys.platform != "linux":
     def _make_triton_mock():
         import importlib.machinery
         m = types.ModuleType("triton")
@@ -51,84 +52,18 @@ if sys.platform == "win32":
     sys.modules["triton.language"] = _triton_mock.language
     sys.modules["triton.runtime"] = _triton_mock.runtime
     sys.modules["triton.testing"] = _triton_mock.testing
-    print("[Worker] Windows triton mock installed", flush=True)
+    print("[Worker] triton mock installed (non-linux)", flush=True)
 
 
-def _find_ffmpeg():
-    """按优先级查找 ffmpeg.exe（返回完整可执行文件路径）"""
-    import shutil
-    import subprocess
+# ── FFmpeg 查找（跨平台，统一走 core.platform）────────────────────────────────
+from core.platform import find_ffmpeg, register_ffmpeg_path
 
-    try:
-        import imageio_ffmpeg
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        if ffmpeg_exe and os.path.isfile(ffmpeg_exe):
-            try:
-                result = subprocess.run(
-                    [ffmpeg_exe, "-version"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if "ffmpeg version" in result.stdout:
-                    print(f"[Worker] 使用 imageio-ffmpeg: {ffmpeg_exe}", flush=True)
-                    return ffmpeg_exe
-            except Exception:
-                pass
-    except ImportError:
-        pass
-
-    winget_base = os.path.join(
-        os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Packages"
-    )
-    if os.path.isdir(winget_base):
-        for entry in os.listdir(winget_base):
-            if entry.startswith("Gyan.FFmpeg"):
-                for sub in os.listdir(os.path.join(winget_base, entry)):
-                    bin_dir = os.path.join(winget_base, entry, sub, "bin")
-                    ffmpeg_exe = os.path.join(bin_dir, "ffmpeg.exe")
-                    if os.path.isfile(ffmpeg_exe):
-                        try:
-                            result = subprocess.run(
-                                [ffmpeg_exe, "-version"],
-                                capture_output=True,
-                                text=True,
-                                timeout=5,
-                            )
-                            if "ffmpeg version" in result.stdout:
-                                print(f"[Worker] 使用 Gyan FFmpeg: {ffmpeg_exe}", flush=True)
-                                return ffmpeg_exe
-                        except Exception:
-                            pass
-
-    ff = shutil.which("ffmpeg")
-    if ff and "ImageMagick" not in ff and os.path.isfile(ff):
-        try:
-            result = subprocess.run(
-                [ff, "-version"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if "ffmpeg version" in result.stdout:
-                print(f"[Worker] 使用系统 FFmpeg: {ff}", flush=True)
-                return ff
-        except Exception:
-            pass
-
-    return None
-
-
-_ffmpeg_bin = _find_ffmpeg()
-_ffmpeg_dir = os.path.dirname(_ffmpeg_bin) if _ffmpeg_bin else None
-if _ffmpeg_dir and hasattr(os, "add_dll_directory"):
-    try:
-        os.add_dll_directory(_ffmpeg_dir)
-    except Exception:
-        pass
-if _ffmpeg_dir:
-    os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
-    print(f"[Worker] FFmpeg DLL path registered: {_ffmpeg_dir}", flush=True)
+_ffmpeg_bin = find_ffmpeg()
+if _ffmpeg_bin:
+    print(f"[Worker] 使用 FFmpeg: {_ffmpeg_bin}", flush=True)
+    _ffmpeg_dir = register_ffmpeg_path(_ffmpeg_bin)
+    if _ffmpeg_dir:
+        print(f"[Worker] FFmpeg 路径已注册: {_ffmpeg_dir}", flush=True)
 
 # 修复 Windows 控制台编码（避免 emoji/中文在 GBK 下报错）
 if sys.platform == "win32":

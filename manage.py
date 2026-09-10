@@ -8,10 +8,28 @@ import os
 import sys
 import subprocess
 import time
-import socket
-import re
+
+# ── 跨平台能力统一走 core.platform ─────────────────────────────────────────────
+# 通过将 backend 目录加入 sys.path，让 manage.py 也能复用 backend 内的平台抽象
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_BACKEND_DIR = os.path.join(_SCRIPT_DIR, "backend")
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+
+from core.platform import (
+    IS_WINDOWS,
+    IS_MACOS,
+    IS_LINUX,
+    is_port_in_use,
+    get_pids_by_port,
+    kill_process_by_port,
+    has_fastapi,
+    resolve_python,
+    no_window_flag,
+)
 
 BACKEND_PORT = 8000
+# 阶段2起前端由后端静态托管，FRONTEND_PORT 仅在开发模式下使用
 FRONTEND_PORT = 5173
 
 # ANSI 颜色定义（Windows 10+ 默认支持）
@@ -20,9 +38,6 @@ YELLOW = "\033[93m"
 RED = "\033[91m"
 BLUE = "\033[94m"
 RESET = "\033[0m"
-
-# 检查系统类型
-IS_WINDOWS = sys.platform == "win32"
 
 def log_info(msg):
     print(f"{BLUE}[信息]{RESET} {msg}")
@@ -36,134 +51,6 @@ def log_warning(msg):
 def log_error(msg):
     print(f"{RED}[错误]{RESET} {msg}")
 
-def is_port_in_use(port):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind(("127.0.0.1", port))
-            return False
-        except socket.error:
-            return True
-
-
-def _has_fastapi(python_exe):
-    """检测指定 Python 解释器是否安装后端运行依赖"""
-    try:
-        r = subprocess.run(
-            [python_exe, "-c", "import fastapi, uvicorn, sqlalchemy, aiosqlite"],
-            capture_output=True,
-            timeout=30,
-        )
-        return r.returncode == 0
-    except Exception:
-        return False
-
-
-def _resolve_python():
-    """
-    返回可用的后端 Python 解释器：
-    1. PEACHTREES_PYTHON 环境变量（显式指定，优先）
-    2. 当前运行 manage.py 的解释器（若已有依赖）
-    3. 探测常见 conda / venv 环境（静默切换，不产生缺依赖警告）
-    4. 兜底返回当前解释器（错误信息会明确提示）
-    """
-    # 1) 环境变量显式指定
-    override = os.environ.get("PEACHTREES_PYTHON", "").strip().strip('"')
-    if override:
-        if os.path.isfile(override) and _has_fastapi(override):
-            log_success(f"使用 PEACHTREES_PYTHON 指定环境: {override}")
-            return override
-        log_warning(
-            f"PEACHTREES_PYTHON 指定的解释器无效或缺少后端依赖: {override}"
-        )
-
-    # 2) 当前解释器已有依赖，直接使用（最常见路径，无任何提示）
-    if _has_fastapi(sys.executable):
-        return sys.executable
-
-    # 3) 常见 conda / venv 环境探测（静默切换：不再打印缺依赖警告，
-    #    找到后以成功信息告知实际使用的环境）
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    cur_dir = os.path.dirname(os.path.abspath(sys.executable))
-    candidates = [
-        os.path.join(cur_dir, "envs", "fastapi", "python.exe"),
-        os.path.join(os.path.dirname(cur_dir), "envs", "fastapi", "python.exe"),
-        r"D:\miniconda3\envs\fastapi\python.exe",
-        os.path.expanduser(r"~\miniconda3\envs\fastapi\python.exe"),
-        os.path.expanduser(r"~\anaconda3\envs\fastapi\python.exe"),
-        os.path.expanduser(r"~\anaconda3\envs\pytorch\python.exe"),
-        os.path.join(script_dir, ".venv", "bin", "python"),
-        os.path.join(script_dir, "venv", "bin", "python"),
-    ]
-    seen = set()
-    for c in candidates:
-        c = os.path.normpath(c)
-        if c in seen or not os.path.isfile(c):
-            continue
-        seen.add(c)
-        if _has_fastapi(c):
-            log_success(f"已自动切换到后端环境: {c}")
-            return c
-
-    # 4) 兜底：返回当前解释器并明确报错（不会静默用错环境）
-    log_error(
-        "未找到带 fastapi 依赖的 Python 环境！请先运行 install_deps.bat 安装依赖，"
-        "或激活 conda 环境后重试（如: conda activate fastapi）"
-    )
-    return sys.executable
-
-def get_pids_by_port(port):
-    """查询监听指定端口的进程 PID 列表（仅统计 LISTENING 状态）。
-
-    只认 LISTENING：TIME_WAIT / CLOSE_WAIT / ESTABLISHED 等残留连接
-    不代表服务仍在运行，避免"已停止却显示运行中"的误报。
-    """
-    pids = set()
-    try:
-        if IS_WINDOWS:
-            # 运行 netstat 命令
-            output = subprocess.check_output(f"netstat -ano", shell=True).decode('utf-8', errors='ignore')
-            # 仅匹配 LISTENING 状态行
-            pattern = re.compile(r"\s+TCP\s+\S+:" + str(port) + r"\s+\S+\s+LISTENING\s+(\d+)")
-            for line in output.splitlines():
-                match = pattern.search(line)
-                if match:
-                    pid = int(match.group(1))
-                    if pid != 0:
-                        pids.add(pid)
-        else:
-            # Unix-like (lsof)：只看 TCP 监听状态的进程
-            output = subprocess.check_output(f"lsof -t -iTCP:{port} -sTCP:LISTEN", shell=True).decode('utf-8', errors='ignore')
-            for line in output.splitlines():
-                if line.strip().isdigit():
-                    pids.add(int(line.strip()))
-    except Exception as e:
-        log_error(f"查询端口 {port} 进程失败: {e}")
-    return list(pids)
-
-def kill_process_by_port(port):
-    """强行关闭占用指定端口的进程"""
-    pids = get_pids_by_port(port)
-    if not pids:
-        log_info(f"端口 {port} 未被占用")
-        return True
-    
-    log_info(f"发现端口 {port} 被进程 {pids} 占用，正在关闭...")
-    success = True
-    for pid in pids:
-        if pid == 0:
-            continue
-        try:
-            if IS_WINDOWS:
-                # 使用 taskkill 强行结束进程及其子进程
-                subprocess.run(f"taskkill /F /T /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                log_success(f"已强制结束 PID 为 {pid} 的进程及其整个子进程树")
-            else:
-                subprocess.run(f"kill -9 {pid}", shell=True)
-                log_success(f"已结束 PID 为 {pid} 的进程")
-        except Exception as e:
-            log_error(f"结束 PID 为 {pid} 的进程失败: {e}")
-            success = False
-    return success
 
 def _open_service_log(name: str):
     """打开服务日志文件（追加模式），供后台进程写入输出"""
@@ -173,36 +60,55 @@ def _open_service_log(name: str):
     return open(log_path, "a", encoding="utf-8", buffering=1)
 
 
-def _no_window_flag() -> int:
-    """Windows 下禁止子进程创建新控制台窗口；其他平台返回 0"""
-    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+def _resolve_python_with_log():
+    """resolve_python 的日志包装：保留原有的用户提示"""
+    # 1) 环境变量显式指定
+    override = os.environ.get("PEACHTREES_PYTHON", "").strip().strip('"')
+    if override:
+        if os.path.isfile(override) and has_fastapi(override):
+            log_success(f"使用 PEACHTREES_PYTHON 指定环境: {override}")
+            return override
+        log_warning(
+            f"PEACHTREES_PYTHON 指定的解释器无效或缺少后端依赖: {override}"
+        )
+
+    python_exe = resolve_python()
+    # 兜底报错提示（与原逻辑一致）
+    if not has_fastapi(python_exe):
+        log_error(
+            "未找到带 fastapi 依赖的 Python 环境！请先运行 install_deps.* 安装依赖，"
+            "或激活 conda 环境后重试（如: conda activate fastapi）"
+        )
+    elif python_exe != sys.executable:
+        log_success(f"已自动切换到后端环境: {python_exe}")
+    return python_exe
 
 
 def start_services():
-    """启动前后端服务（后台运行，不打开新终端窗口，日志写入 logs/ 目录）"""
+    """启动后端服务（后台运行，不打开新终端窗口，日志写入 logs/ 目录）
+
+    阶段2 改造：前端已由后端静态托管，不再需要独立的 Vite 进程。
+    开发模式下若需前端热更新，可手动在 frontend/ 运行 `npm run dev`。
+    """
     # 1. 检查端口占用情况并清理
     backend_running = is_port_in_use(BACKEND_PORT)
-    frontend_running = is_port_in_use(FRONTEND_PORT)
 
-    if backend_running or frontend_running:
-        log_warning("检测到部分服务端口已被占用！")
-        if backend_running:
-            log_warning(f"端口 {BACKEND_PORT} (后端) 已被占用")
-        if frontend_running:
-            log_warning(f"端口 {FRONTEND_PORT} (前端) 已被占用")
+    if backend_running:
+        log_warning("检测到后端端口已被占用！")
+        log_warning(f"端口 {BACKEND_PORT} (后端) 已被占用")
         log_info("正在尝试清理已有服务进程...")
         stop_services()
         time.sleep(1.5)
 
     log_info("正在启动后端服务 (FastAPI / Uvicorn)...")
     # 自动探测带依赖的 Python 解释器（PATH 中的默认 python 可能缺少 fastapi）
-    python_exe = _resolve_python()
+    python_exe = _resolve_python_with_log()
     log_info(f"后端解释器: {python_exe}")
     # 生产模式不启用 --reload：reload 的重载器在重启时会直接杀死进程树，
     # 导致 TTS 推理 worker 子进程变成孤儿进程，持续占用 GPU 显存。
     backend_cmd = f'"{python_exe}" -m uvicorn main:app --host 0.0.0.0 --port {BACKEND_PORT}'
     backend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend")
-    
+
     try:
         # 后台启动（无新窗口）：输出重定向到日志文件，便于排查问题
         backend_log = _open_service_log("backend")
@@ -219,75 +125,81 @@ def start_services():
             env=_backend_env,
             stdout=backend_log,
             stderr=subprocess.STDOUT,
-            creationflags=_no_window_flag(),
+            creationflags=no_window_flag(),
         )
         log_success("后端服务已后台启动（日志: logs/backend.log）")
     except Exception as e:
         log_error(f"后端启动失败: {e}")
         return
 
-    log_info("正在启动前端服务 (Vite)...")
-    frontend_cmd = "npm run dev"
-    frontend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend")
-    
-    try:
-        # 后台启动（无新窗口）：输出重定向到日志文件，便于排查问题
-        frontend_log = _open_service_log("frontend")
-        subprocess.Popen(
-            frontend_cmd,
-            cwd=frontend_dir,
-            shell=True,
-            stdout=frontend_log,
-            stderr=subprocess.STDOUT,
-            creationflags=_no_window_flag(),
-        )
-        log_success("前端服务已后台启动（日志: logs/frontend.log）")
-    except Exception as e:
-        log_error(f"前端启动失败: {e}")
-        return
-
     # 等待几秒检测服务是否正常起来
     log_info("正在等待服务就绪，检测端口占用中...")
     for _ in range(6):
         time.sleep(1)
-        if is_port_in_use(BACKEND_PORT) and is_port_in_use(FRONTEND_PORT):
+        if is_port_in_use(BACKEND_PORT):
             break
 
     show_status()
 
 def stop_services():
-    """停止前后端服务"""
-    log_info("开始关闭前后端服务...")
+    """停止后端服务"""
+    log_info("开始关闭后端服务...")
     backend_stopped = kill_process_by_port(BACKEND_PORT)
-    frontend_stopped = kill_process_by_port(FRONTEND_PORT)
-    
-    if backend_stopped and frontend_stopped:
-        log_success("前后端服务已全部关闭。")
+
+    if backend_stopped:
+        log_success("后端服务已全部关闭。")
     else:
         log_warning("部分服务可能未完全关闭，请手动检查。")
+
+def build_frontend():
+    """构建前端到 backend/static（阶段2：前端静态托管）
+
+    需先在 frontend/ 安装依赖：`npm install`
+    """
+    frontend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend")
+    if not os.path.isdir(frontend_dir):
+        log_error(f"前端目录不存在: {frontend_dir}")
+        return
+
+    node_modules = os.path.join(frontend_dir, "node_modules")
+    if not os.path.isdir(node_modules):
+        log_info("前端依赖未安装，正在执行 npm install...")
+        try:
+            subprocess.run(
+                "npm install", cwd=frontend_dir, shell=True, check=True,
+                creationflags=no_window_flag(),
+            )
+        except subprocess.CalledProcessError as e:
+            log_error(f"npm install 失败: {e}")
+            return
+
+    log_info("正在构建前端到 backend/static/...")
+    try:
+        subprocess.run(
+            "npm run build", cwd=frontend_dir, shell=True, check=True,
+            creationflags=no_window_flag(),
+        )
+        log_success("前端构建完成，访问 http://localhost:8000 查看界面")
+    except subprocess.CalledProcessError as e:
+        log_error(f"前端构建失败: {e}")
+
 
 def show_status():
     """查看服务状态"""
     print("\n" + "="*45)
     print("         PeachTrees 服务运行状态        ")
     print("="*45)
-    
+
     backend_pids = get_pids_by_port(BACKEND_PORT)
-    frontend_pids = get_pids_by_port(FRONTEND_PORT)
-    
+
     if backend_pids:
         print(f"后端服务 (端口 {BACKEND_PORT}): {GREEN}● 运行中{RESET} (PID: {backend_pids})")
-        print(f"  └─ API 接口文档: {BLUE}http://localhost:{BACKEND_PORT}/docs{RESET}")
+        print(f"  └─ 访问地址: {BLUE}http://localhost:{BACKEND_PORT}{RESET}")
+        print(f"  └─ API 文档: {BLUE}http://localhost:{BACKEND_PORT}/docs{RESET}")
     else:
         print(f"后端服务 (端口 {BACKEND_PORT}): {RED}○ 已停止{RESET}")
-        
-    if frontend_pids:
-        print(f"前端服务 (端口 {FRONTEND_PORT}): {GREEN}● 运行中{RESET} (PID: {frontend_pids})")
-        print(f"  └─ 前端访问地址: {BLUE}http://localhost:{FRONTEND_PORT}{RESET}")
-    else:
-        print(f"前端服务 (端口 {FRONTEND_PORT}): {RED}○ 已停止{RESET}")
     print("="*45 + "\n")
-    print(f"服务日志目录: {BLUE}logs/{RESET}（backend.log / frontend.log，可随时查看服务输出）\n")
+    print(f"服务日志目录: {BLUE}logs/{RESET}（backend.log，可随时查看服务输出）\n")
 
 def main():
     # 修复 Windows 控制台颜色输出支持
@@ -295,11 +207,12 @@ def main():
         os.system('color')
 
     if len(sys.argv) < 2:
-        print("用法: python manage.py [start|stop|restart|status]")
-        print("  - start:   启动前后端服务")
-        print("  - stop:    关闭前后端服务")
-        print("  - restart: 重启前后端服务")
+        print("用法: python manage.py [start|stop|restart|status|build]")
+        print("  - start:   启动后端服务（前端已由后端静态托管）")
+        print("  - stop:    关闭后端服务")
+        print("  - restart: 重启后端服务")
         print("  - status:  查看服务运行状态")
+        print("  - build:   构建前端到 backend/static（需先安装 frontend 依赖）")
         return
 
     action = sys.argv[1].lower()
@@ -314,9 +227,11 @@ def main():
         start_services()
     elif action == "status":
         show_status()
+    elif action == "build":
+        build_frontend()
     else:
         log_error(f"未知指令: {action}")
-        print("支持指令: start, stop, restart, status")
+        print("支持指令: start, stop, restart, status, build")
 
 if __name__ == "__main__":
     main()

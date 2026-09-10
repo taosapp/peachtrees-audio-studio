@@ -37,6 +37,12 @@ frontend/.vite/
 .pnpm-store/
 *.log
 
+# ── 跨平台改造：构建产物 ────────────────────────────────────────────────────
+backend/static/
+electron-shell/node_modules/
+electron-shell/dist/
+logs/
+
 # ── 环境与依赖 ─────────────────────────────────────────────────────────────
 venv/
 .venv/

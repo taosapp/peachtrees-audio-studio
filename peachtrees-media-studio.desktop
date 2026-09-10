@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=PeachTrees Media Studio
+Comment=本地声音克隆与语音合成平台
+Exec=python3 manage.py start
+Path=/path/to/peachtreesMediaStudio
+Terminal=true
+Type=Application
+Categories=AudioVideo;Audio;

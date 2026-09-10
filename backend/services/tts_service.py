@@ -18,9 +18,10 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-# ── triton monkey-patch（Windows 不支持 triton，flash_attn 2.7.4 + transformers 4.51.3 需要）──
+# ── triton monkey-patch（Windows/macOS 不支持 triton，flash_attn 2.7.4 + transformers 4.51.3 需要）──
 # 详细说明见 tts_infer_worker.py 同名段落
-if sys.platform == "win32":
+# Linux 原生支持 triton，无需 mock；macOS 与 Windows 同样需要
+if sys.platform != "linux":
     import types
 
     def _make_triton_mock():
@@ -77,83 +78,13 @@ for _env in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
 os.environ["NO_PROXY"] = "*"
 os.environ["no_proxy"] = "*"
 
-# ── FFmpeg DLL 搜索路径 ────────────────────────────────────────────────────────
+# ── FFmpeg 查找（跨平台，统一走 core.platform）────────────────────────────────
+from core.platform import find_ffmpeg, register_ffmpeg_path
 
-
-def _find_ffmpeg():
-    """按优先级查找 ffmpeg.exe（返回完整可执行文件路径）"""
-    import shutil
-    import subprocess
-
-    try:
-        import imageio_ffmpeg
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        if ffmpeg_exe and os.path.isfile(ffmpeg_exe):
-            try:
-                result = subprocess.run(
-                    [ffmpeg_exe, "-version"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if "ffmpeg version" in result.stdout:
-                    print(f"[TTS] 使用 imageio-ffmpeg: {ffmpeg_exe}")
-                    return ffmpeg_exe
-            except Exception:
-                pass
-    except ImportError:
-        pass
-
-    winget_base = os.path.join(
-        os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Packages"
-    )
-    if os.path.isdir(winget_base):
-        for entry in os.listdir(winget_base):
-            if entry.startswith("Gyan.FFmpeg"):
-                for sub in os.listdir(os.path.join(winget_base, entry)):
-                    bin_dir = os.path.join(winget_base, entry, sub, "bin")
-                    ffmpeg_exe = os.path.join(bin_dir, "ffmpeg.exe")
-                    if os.path.isfile(ffmpeg_exe):
-                        try:
-                            result = subprocess.run(
-                                [ffmpeg_exe, "-version"],
-                                capture_output=True,
-                                text=True,
-                                timeout=5,
-                            )
-                            if "ffmpeg version" in result.stdout:
-                                print(f"[TTS] 使用 Gyan FFmpeg: {ffmpeg_exe}")
-                                return ffmpeg_exe
-                        except Exception:
-                            pass
-
-    ff = shutil.which("ffmpeg")
-    if ff and "ImageMagick" not in ff and os.path.isfile(ff):
-        try:
-            result = subprocess.run(
-                [ff, "-version"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if "ffmpeg version" in result.stdout:
-                print(f"[TTS] 使用系统 FFmpeg: {ff}")
-                return ff
-        except Exception:
-            pass
-
-    return None
-
-
-_ffmpeg_bin = _find_ffmpeg()
-_ffmpeg_dir = os.path.dirname(_ffmpeg_bin) if _ffmpeg_bin else None
-if _ffmpeg_dir and hasattr(os, "add_dll_directory"):
-    try:
-        os.add_dll_directory(_ffmpeg_dir)
-    except Exception:
-        pass
-if _ffmpeg_dir:
-    os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+_ffmpeg_bin = find_ffmpeg()
+if _ffmpeg_bin:
+    print(f"[TTS] 使用 FFmpeg: {_ffmpeg_bin}")
+    register_ffmpeg_path(_ffmpeg_bin)
 
 # ── 路径配置（从 core.config 统一读取）──────────────────────────────────
 from core.config import (

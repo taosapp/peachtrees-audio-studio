@@ -1,0 +1,49 @@
+{
+  "name": "peachtrees-media-studio",
+  "version": "2.3.0",
+  "description": "PeachTrees Media Studio - 本地声音克隆与语音合成桌面应用",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux"
+  },
+  "author": "PeachTrees",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "dependencies": {
+    "selfsigned": "^2.4.1"
+  },
+  "build": {
+    "appId": "com.peachtrees.media-studio",
+    "productName": "PeachTrees Media Studio",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "build/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "build/icon.icns",
+      "category": "public.app-category.audio"
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "icon": "build/icon.png",
+      "category": "AudioVideo"
+    }
+  }
+}

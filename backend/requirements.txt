@@ -20,8 +20,10 @@ cn2an
 
 # ── CosyVoice3 完整依赖 ──
 # 来源：third_party/cosyvoice/requirements.txt（已排除 Linux-only deps）
+# 平台差异：deepspeed/onnxruntime-gpu/tensorrt 仅 Linux 可用
 hyperpyyaml
-onnxruntime
+onnxruntime; sys_platform == 'darwin' or sys_platform == 'win32'
+onnxruntime-gpu; sys_platform == 'linux'
 conformer
 diffusers
 gdown
